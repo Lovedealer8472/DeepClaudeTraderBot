@@ -144,81 +144,58 @@ def log_trade_decision(decision: DecisionEvent, bot_instance=None) -> None:
     symbol_short = (decision.symbol or "?").replace("/USDT", "")
     
     if decision.action == "ENTRY":
-        # ENTRY format: "ENTRY sym=XYZ/USDT side=SHORT sz=15.0% lev=5x entry=0.1234 Scr=83"
-        # SCORING V2: Add component breakdown if available
-        side_str = decision.side or "?"
-        size_pct = (decision.size / decision.entry_price * 100) if (decision.size and decision.entry_price) else 0.0
-        entry_price_str = f"{decision.entry_price:.4f}" if decision.entry_price else "?"
-        score_str = f"{decision.score:.1f}" if decision.score is not None else "?"
-        lev_str = getattr(decision, 'leverage', None)
-        lev_str = f" lev={lev_str}x" if lev_str else ""
+        # ENTRY format: "[ENTRY] symbol side qty=%.4f px=%.6f Scr=%.1f base=%.1f"
+        side_str = (decision.side or "?").upper()
+        qty = decision.size if decision.size else 0.0
+        px = decision.entry_price if decision.entry_price else 0.0
+        score = decision.score if decision.score is not None else 0.0
         
-        # SCORING V2: Add component breakdown if available
-        components_str = ""
+        # Extract base score from components if available
+        base_score = score  # Default to full score if components not available
         if hasattr(decision, 'score_components_capped') and decision.score_components_capped:
             try:
                 comp = decision.score_components_capped
-                components_str = (
-                    f" | base={comp.get('base', 0):.1f} "
-                    f"Lq={comp.get('liquidity', 0):+.1f} "
-                    f"Reg={comp.get('regime', 0):+.1f} "
-                    f"Str={comp.get('structure', 0):+.1f} "
-                    f"Pf={comp.get('portfolio', 0):+.1f} "
-                    f"T={comp.get('time_of_day', 0):+.1f} "
-                    f"Sym={comp.get('symbol_rating', 0):+.1f}"
-                )
-            except Exception:
-                pass  # Skip components if formatting fails
-        
-        # SCALPER UPGRADE: Add filter details if available
-        filter_str = ""
-        if hasattr(decision, 'filter_details') and decision.filter_details:
-            try:
-                fd = decision.filter_details
-                stage3_score = fd.get('stage3', {}).get('direction_score', 0)
-                stage2_count = fd.get('stage2', {}).get('count', 0)
-                if stage3_score > 0:
-                    filter_str = f" | dir={stage3_score:.2f} struct={stage2_count}"
+                base_score = comp.get('base', score)
             except Exception:
                 pass
 
         logger.info(
-            f"ENTRY sym={decision.symbol} side={side_str} sz={size_pct:.1f}%{lev_str} entry={entry_price_str} Scr={score_str}{components_str}{filter_str}"
+            f"[ENTRY] {decision.symbol} {side_str} qty={qty:.4f} px={px:.6f} Scr={score:.1f} base={base_score:.1f}"
         )
     
     elif decision.action in ("EXIT", "PARTIAL_EXIT", "SCALE_OUT"):
-        # EXIT format: "EXIT sym=XYZ/USDT pnl=$+1.23 (+0.52%) R=+1.1 reason=trailing_stop"
-        pnl_str = f"${decision.net_pnl or decision.pnl_value:+.2f}" if (decision.net_pnl is not None or decision.pnl_value is not None) else "$0.00"
-        pnl_pct_str = f"({decision.pnl_pct:+.2f}%)" if decision.pnl_pct is not None else ""
+        # EXIT format: "[EXIT] symbol side R=%.2f pnl=%.4f hold=%ds reason=%s"
+        side_str = (decision.side or "?").upper()
         
-        # Calculate R (risk multiple) if we have entry/exit prices
-        r_str = ""
+        # Calculate R (risk multiple) from entry/exit prices and stop loss
+        r_value = 0.0
         if decision.entry_price and decision.exit_price and decision.side:
             try:
-                if decision.side.upper() == "LONG":
-                    r = (decision.exit_price - decision.entry_price) / abs(decision.entry_price - getattr(decision, 'stop_loss', decision.entry_price * 0.99))
-                else:
-                    r = (decision.entry_price - decision.exit_price) / abs(decision.entry_price - getattr(decision, 'stop_loss', decision.entry_price * 1.01))
-                r_str = f" R={r:+.1f}"
-            except (ZeroDivisionError, TypeError):
+                stop_loss = getattr(decision, 'stop_loss', None)
+                if stop_loss and decision.entry_price > 0:
+                    if decision.side.upper() == "LONG":
+                        stop_distance = abs(decision.entry_price - stop_loss)
+                        profit = decision.exit_price - decision.entry_price
+                    else:  # SHORT
+                        stop_distance = abs(stop_loss - decision.entry_price)
+                        profit = decision.entry_price - decision.exit_price
+                    if stop_distance > 0:
+                        r_value = profit / stop_distance
+            except (ZeroDivisionError, TypeError, AttributeError):
                 pass
         
-        reason_str = f" reason={decision.reason}" if decision.reason else ""
+        # PnL in quote currency (use net_pnl if available, else pnl_value)
+        pnl_value = decision.net_pnl if decision.net_pnl is not None else (decision.pnl_value if decision.pnl_value is not None else 0.0)
         
-        if decision.action == "PARTIAL_EXIT":
-            # Calculate exit percentage from size_before/size_after
-            exit_pct = 0
-            if decision.size_before and decision.size_before > 0:
-                exit_pct = ((decision.size_before - (decision.size_after or 0)) / decision.size_before) * 100
-            
-            logger.info(
-                f"EXIT sym={decision.symbol} pnl={pnl_str} {pnl_pct_str}{r_str} reason=partial_exit_{exit_pct:.0f}%{reason_str}"
-            )
-        else:
-            # Full exit
-            logger.info(
-                f"EXIT sym={decision.symbol} pnl={pnl_str} {pnl_pct_str}{r_str}{reason_str}"
-            )
+        # Hold time in seconds
+        hold_sec = int(decision.duration_sec) if decision.duration_sec is not None else 0
+        
+        # Exit reason (concise)
+        reason_str = decision.reason if decision.reason else "unknown"
+        
+        logger.info(
+            f"[EXIT] {decision.symbol} {side_str} R={r_value:.2f} pnl={pnl_value:.4f} hold={hold_sec}s reason={reason_str}"
+        )
 
 
 def get_recent_decision_events(limit: int = 20) -> List[DecisionEvent]:

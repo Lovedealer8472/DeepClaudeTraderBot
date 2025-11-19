@@ -439,7 +439,7 @@ class ExitPipeline:
                     position['trailing_stop_exit_triggered'] = True
                     # If position size is tiny, just close it
                     if position.get('size', 0) <= 0.001:
-                        self.logger.info(f"EXIT_SKIPPED {symbol} trailing_stop (tiny size)")
+                        self.logger.debug(f"EXIT_SKIPPED {symbol} trailing_stop (tiny size)")
                         # Remove position to prevent retries
                         self.position_registry.remove(symbol)
                         return False
@@ -559,7 +559,27 @@ class ExitPipeline:
         if bot_instance and request.exit_size_ratio >= 1.0:
             equity = bot_instance.equity_now() if hasattr(bot_instance, 'equity_now') else 0
             pnl_pct_for_manager = (exit_result.net_pnl / equity * 100) if exit_result.net_pnl and equity > 0 else None
-            bot_instance.position_manager.record_exit(symbol, was_win, pnl_pct=pnl_pct_for_manager)
+            # Calculate profit_atr for churn tracking (if time_exit)
+            profit_atr = None
+            if request.reason and request.reason.startswith("time_exit"):
+                # Try to extract from reason string: "time_exit: 4 bars, profit=0.00ATR"
+                import re
+                match = re.search(r'profit=([\d\.-]+)ATR', request.reason)
+                if match:
+                    try:
+                        profit_atr = float(match.group(1))
+                    except (ValueError, AttributeError):
+                        pass
+                # Fallback: calculate from position data if available
+                if profit_atr is None and entry_price > 0 and exit_result.exit_price > 0:
+                    atr_pct = current_position.get('atr_pct', None)
+                    if atr_pct and atr_pct > 0:
+                        if position_side.lower() == 'long':
+                            profit_pct = ((exit_result.exit_price - entry_price) / entry_price)
+                        else:
+                            profit_pct = ((entry_price - exit_result.exit_price) / entry_price)
+                        profit_atr = profit_pct / atr_pct
+            bot_instance.position_manager.record_exit(symbol, was_win, pnl_pct=pnl_pct_for_manager, exit_reason=request.reason, profit_atr=profit_atr)
         
         # Update metrics
         if bot_instance and hasattr(bot_instance, 'metrics'):

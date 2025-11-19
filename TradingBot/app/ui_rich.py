@@ -798,25 +798,19 @@ class Dashboard:
 
     def update(self, state: BotState):
         """Update the dashboard with new state."""
-        from .logger import get_logger
-        log = get_logger("UI")
-        
-        log.debug(f"[UI] update() called | positions={len(state.open_positions)} | equity={state.equity:.2f} | signals={len(state.signal_queue)}")
-        
         if not self._live:
-            log.warning("[UI] update() called but _live is None - UI not initialized")
             return
         
         try:
             layout = build_layout(state)
-            # CRITICAL: Ensure we're updating the Live context
+            # CRITICAL: Single update call per render to prevent flicker
+            # Ensure we're updating the Live context
             if self._live:
                 self._live.update(layout, refresh=True)
-                log.debug("[UI] update() completed successfully")
-            else:
-                log.warning("[UI] _live is None during update")
         except Exception as e:
-            # Log UI update errors so we can diagnose issues
+            # Log UI update errors so we can diagnose issues (but only errors, not debug)
+            from .logger import get_logger
+            log = get_logger("UI")
             log.error(f"[UI] update() failed: {type(e).__name__}: {e}", exc_info=True)
             # Don't re-raise to avoid breaking the UI loop, but log it
 

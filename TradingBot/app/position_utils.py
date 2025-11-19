@@ -203,6 +203,11 @@ def apply_exit_and_log(
     """
     from .decision_event import DecisionEvent, log_trade_decision
     
+    # STEP 0: Get stop_loss from position BEFORE it's deleted (for R calculation)
+    stop_loss = None
+    if symbol in positions:
+        stop_loss = positions[symbol].get('stop_loss')
+    
     # STEP 1: Update position atomically
     success, status_msg = update_position_after_exit(
         positions=positions,
@@ -243,7 +248,8 @@ def apply_exit_and_log(
             prs=prs,
             duration_sec=duration,
             was_win=was_win,
-            is_unicorn=is_unicorn
+            is_unicorn=is_unicorn,
+            stop_loss=stop_loss  # For R calculation in exit log
         )
         
         # Log using unified system (writes to decisions.jsonl, recent_trades, and Recent Activity buffer)

@@ -58,6 +58,17 @@ class Performance:
 
 
 @dataclass
+class SignalHealth:
+    """Signal generation health metrics."""
+    signals_generated: int  # Total signals generated (cumulative)
+    signals_approved: int  # Signals that passed all filters
+    signals_rejected: int  # Signals that were blocked
+    pass_rate: float  # 0-100% (approved / generated)
+    avg_signal_score: float  # Average score of all signals (0-100)
+    avg_latency_ms: float  # Average signal evaluation latency
+
+
+@dataclass
 class RiskSnapshot:
     """Risk and market conditions."""
     open_positions: int
@@ -132,6 +143,7 @@ class EngineSnapshot:
     timestamp: datetime
     global_status: GlobalStatus
     performance: Performance
+    signal_health: SignalHealth
     risk: RiskSnapshot
     open_positions: List[PositionSnapshot] = field(default_factory=list)
     recent_activity: List[ActivityEvent] = field(default_factory=list)
@@ -288,7 +300,65 @@ def build_engine_snapshot(bot, debug: bool = False) -> EngineSnapshot:
     )
     
     # ═══════════════════════════════════════════════════════════
-    # 3) RISK SNAPSHOT
+    # 3) SIGNAL HEALTH (wired to filter_stats_cumulative)
+    # ═══════════════════════════════════════════════════════════
+    
+    # CRITICAL: Signal Health panel reads from cumulative filter stats
+    # These stats are updated in bot.py scan_and_enter_signals() after each scan
+    # - signals_total: Cumulative count of signals generated (passed signal generator)
+    # - signals_passed: Cumulative count of signals that passed filter pipeline AND position manager
+    # - signals_rejected: Cumulative count of rejected signals (signals_total - signals_passed)
+    # Source: bot.filter_stats_cumulative (updated in bot.py line 2295-2297)
+    filter_stats = getattr(bot, "filter_stats_cumulative", {}) or {}
+    signals_generated = filter_stats.get('signals_total', 0) or 0
+    signals_approved = filter_stats.get('signals_passed', 0) or 0
+    signals_rejected = filter_stats.get('signals_rejected', 0) or 0
+    
+    # Fallback to signal_history if cumulative stats not available yet (e.g., during startup)
+    # NOTE: This fallback is less accurate (only last 100 signals) but provides initial values
+    if signals_generated == 0:
+        signal_history = list(getattr(bot, "signal_history", []) or [])
+        recent_signals = signal_history[-100:] if len(signal_history) > 100 else signal_history
+        signals_generated = len(recent_signals)
+        signals_approved = sum(1 for s in recent_signals if s.get("approved", False))
+        signals_rejected = signals_generated - signals_approved
+    
+    # Calculate pass rate (0-100%) with defensive division
+    pass_rate = (signals_approved / signals_generated * 100.0) if signals_generated > 0 else 0.0
+    
+    # Average signal score from cumulative stats
+    # Source: Updated in bot.py line 2300-2303 (running average of all signal scores)
+    avg_score_count = filter_stats.get('avg_score_count', 0) or 0
+    avg_score_sum = filter_stats.get('avg_score_sum', 0.0) or 0.0
+    avg_signal_score = (avg_score_sum / avg_score_count) if avg_score_count > 0 else 0.0
+    
+    # Fallback to signal_history if cumulative stats not available (e.g., during startup)
+    if avg_signal_score == 0.0:
+        signal_history = list(getattr(bot, "signal_history", []) or [])
+        recent_signals = signal_history[-100:] if len(signal_history) > 100 else signal_history
+        scores = [s.get("final_score", 0) for s in recent_signals if s.get("final_score")]
+        avg_signal_score = (sum(scores) / len(scores)) if scores else 0.0
+    
+    # Average latency (from signal history if available)
+    # NOTE: Latency tracking is optional - gracefully handle missing data
+    signal_history = list(getattr(bot, "signal_history", []) or [])
+    recent_signals = signal_history[-100:] if len(signal_history) > 100 else signal_history
+    latencies = [s.get("latency_ms", 0) for s in recent_signals if s.get("latency_ms")]
+    avg_latency_ms = (sum(latencies) / len(latencies)) if latencies else 0.0
+    
+    # Build SignalHealth dataclass with defensive defaults
+    # All fields are guaranteed to have valid values (0 for counts, 0.0 for rates/scores)
+    signal_health = SignalHealth(
+        signals_generated=signals_generated,
+        signals_approved=signals_approved,
+        signals_rejected=signals_rejected,
+        pass_rate=pass_rate,
+        avg_signal_score=avg_signal_score,
+        avg_latency_ms=avg_latency_ms,
+    )
+    
+    # ═══════════════════════════════════════════════════════════
+    # 4) RISK SNAPSHOT
     # ═══════════════════════════════════════════════════════════
     
     open_positions_count = len(positions_dict)
@@ -360,6 +430,10 @@ def build_engine_snapshot(bot, debug: bool = False) -> EngineSnapshot:
     # 4) OPEN POSITIONS
     # ═══════════════════════════════════════════════════════════
     
+    # CRITICAL: Open Positions table reads directly from bot.positions
+    # bot.positions is a direct reference to position_registry._positions (bot.py line 142)
+    # This ensures UI always shows current position state (no stale data)
+    # Source: bot.positions (updated in bot.py when positions are opened/closed)
     open_positions = []
     for symbol, position in positions_dict.items():
         if not position:
@@ -538,6 +612,11 @@ def build_engine_snapshot(bot, debug: bool = False) -> EngineSnapshot:
     # 6) SIGNAL QUEUE
     # ═══════════════════════════════════════════════════════════
     
+    # CRITICAL: Signal Queue shows recent rejected signals from signal_history
+    # signal_history is populated in bot.py when signals are generated/rejected
+    # - Approved signals: added with approved=True (bot.py line 1751)
+    # - Rejected signals: added with approved=False (bot.py lines 1355, 1691)
+    # Source: bot.signal_history (deque, maxlen=20, updated in bot.py)
     signal_queue = []
     signal_history = list(getattr(bot, "signal_history", []) or [])
     rejected_signals = [s for s in signal_history[-50:] if not s.get("approved", True)]
@@ -585,6 +664,7 @@ def build_engine_snapshot(bot, debug: bool = False) -> EngineSnapshot:
         timestamp=timestamp,
         global_status=global_status,
         performance=performance,
+        signal_health=signal_health,
         risk=risk,
         open_positions=open_positions,
         recent_activity=recent_activity,

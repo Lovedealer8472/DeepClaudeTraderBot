@@ -439,12 +439,12 @@ def evaluate_three_stage_filter(
         side, advanced_features, indicators, symbol_stats
     )
     if not stage2_result.passed:
-        # DEBUG: Print when Stage 1 passes but Stage 2 fails
-        print(f"[DEBUG FILTER] {symbol} | stage_passed=stage1 | final_score={final_score or 'N/A'}")
+        # DEBUG: Log to file only (no console output)
+        # Removed print() to prevent console output - use logger if needed
         return False, stage2_result.reason, stage2_result.details, confluence
     
-    # DEBUG: Print when both Stage 1 and Stage 2 pass
-    print(f"[DEBUG FILTER] {symbol} | stage_passed=stage1+stage2 | final_score={final_score or 'N/A'}")
+    # DEBUG: Log to file only (no console output)
+    # Removed print() to prevent console output - use logger if needed
     
     # Stage 3: Direction
     stage3_result = stage3_direction_prediction(

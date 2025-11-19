@@ -91,10 +91,17 @@ MIN_POSITION_PCT = env("MIN_POSITION_PCT", "0.5", float)  # Minimum position siz
 
 # Risk Management - PURE SCALPER MODE: Simple, tight risk limits
 TOTAL_RISK_BUDGET = env("TOTAL_RISK_BUDGET", "2.0", float) / 100.0  # Total risk budget as % of equity (2% = 0.02) - scalper-friendly
-MAX_OPEN_POSITIONS = env("MAX_OPEN_POSITIONS", "5", int)  # Hard maximum positions for LIVE balanced scalper (3-5 typical)
+# NOTE: Effective max positions are now dynamic: floor(MAX_ACCOUNT_RISK_PCT / RISK_PER_TRADE_PCT),
+# but never exceed MAX_CONCURRENT_POS_HARD. The old MAX_OPEN_POSITIONS is kept for backward compatibility.
+MAX_OPEN_POSITIONS = env("MAX_OPEN_POSITIONS", "5", int)  # Legacy: kept for backward compatibility, not used as hard gate
 MAX_CONCURRENT_POS = MAX_OPEN_POSITIONS  # Alias for backward compatibility
 MAX_CONCURRENT_POS_MIN = env("MAX_CONCURRENT_POS_MIN","1", int)  # Minimum positions (scalper: 1-3)
-MAX_CONCURRENT_POS_MAX = env("MAX_CONCURRENT_POS_MAX","5", int)  # LIVE MODE: Cap at 5 for balanced scalper (was 3)
+MAX_CONCURRENT_POS_MAX = env("MAX_CONCURRENT_POS_MAX","5", int)  # Legacy: kept for backward compatibility, not used as hard gate
+
+# Dynamic risk-based position cap (Option B)
+MAX_ACCOUNT_RISK_PCT = env("MAX_ACCOUNT_RISK_PCT", "5.0", float)  # Max % of account equity we are willing to have at risk across all open positions (per direction)
+RISK_PER_TRADE_PCT = env("RISK_PER_TRADE_PCT", "0.5", float)  # Target % of equity risked per position. With 5.0 / 0.5 = 10, this yields up to 10 concurrent positions
+MAX_CONCURRENT_POS_HARD = env("MAX_CONCURRENT_POS_HARD", "20", int)  # Absolute upper bound on open positions regardless of risk math
 
 # Per-trade risk bounds
 MIN_RISK_PER_TRADE = env("MIN_RISK_PER_TRADE", "0.2", float) / 100.0  # 0.2% minimum per trade (below this, trades are noise)
@@ -135,6 +142,19 @@ COOLDOWN_SEC       = env("COOLDOWN_SEC","30", int)  # Reduced to 30s for faster 
 COOLDOWN_SAME_SYMBOL = env("COOLDOWN_SAME_SYMBOL","300", int)  # 5 minute cooldown for same symbol (reduced from 30min for futures)
 COOLDOWN_AFTER_EXIT = env("COOLDOWN_AFTER_EXIT","120", int)  # 2 minutes cooldown after exit (softened to prevent stale loss lockout)
 COOLDOWN_DIFF_SYMBOL = env("COOLDOWN_DIFF_SYMBOL","10", int)  # Shorter cooldown for different symbols (reduced for futures)
+# After flat-ish time_exit (|R| <= 0.25), block re-entries on that symbol for a while
+SYMBOL_CHURN_COOLDOWN_SEC = env("SYMBOL_CHURN_COOLDOWN_SEC", "900", int)  # 15 min; safe for LIVE and DRY
+# Time-based exit: more patient, only kill losers/zombies
+TIME_EXIT_BARS = env("TIME_EXIT_BARS", "10", int)  # More patient, ~10 candles before we even consider nuking (was 4)
+
+# === DRY_RUN sandbox exits ===
+# When enabled, DRY_RUN uses simple SL/TP exits only (no partials/trailing).
+DRY_SIMPLE_EXITS = env("DRY_SIMPLE_EXITS", "1") in ("1","true","TRUE")  # Enable simple exits in DRY_RUN
+# Simple DRY exits in R-multiples (R based on initial SL distance).
+DRY_SIMPLE_SL_R = env("DRY_SIMPLE_SL_R", "-1.0", float)  # full stop at -1R
+DRY_SIMPLE_TP_R = env("DRY_SIMPLE_TP_R", "1.8", float)  # take profit at +1.8R
+# NOTE: LIVE always uses full exit engine (partials, trailing, etc.).
+# These DRY_* settings must never be consulted in LIVE mode.
 STATE_SAVE_SEC     = env("STATE_SAVE_SEC","10", int)
 MAX_ENTRIES_PER_MIN= env("MAX_ENTRIES_PER_MIN","10", int)  # Increased to 10 for Binance Futures (more aggressive, appropriate for futures)
 
@@ -144,16 +164,17 @@ MAX_SPREAD_BPS     = env("MAX_SPREAD_BPS","100", float)  # Absolute maximum spre
 MIN_VOLUME_24H     = env("MIN_VOLUME_24H","1000000", float)  # Minimum $1M 24h volume - relaxed for Binance Futures
 MAX_LATENCY_MS     = env("MAX_LATENCY_MS","50", int)  # Ultra-low latency: 50ms (cached data only, no API calls)
 MIN_SIGNAL_STRENGTH = env("MIN_SIGNAL_STRENGTH","0.60", float)  # Minimum signal strength (0-1 scale) - relaxed for Binance Futures
-# BALANCED SCALPER MODE: Moderate minimum scores (72-75 for balanced setups)
-MIN_SIGNAL_SCORE = env("MIN_SIGNAL_SCORE","72", int)  # Minimum signal score for balanced scalper (72-73 range, loosened from 75)
-HARD_MIN_SCORE = env("HARD_MIN_SCORE", "70", int)  # Hard minimum score threshold - signals below this are immediately rejected
+# PURE_SCALPER MODE: Static score thresholds (no dynamic adjustments)
+MIN_SIGNAL_SCORE = env("MIN_SIGNAL_SCORE","71", int)  # Main entry gate threshold (static in PURE_SCALPER mode)
+HARD_MIN_SCORE = env("HARD_MIN_SCORE", "68", int)  # Hard floor (auto reject if below) - should be a couple points below MIN_SIGNAL_SCORE
 SIGNAL_PERCENTILE_THRESHOLD = env("SIGNAL_PERCENTILE_THRESHOLD","0.0", float)  # LIVE MODE: Disabled (0.0 = no percentile filtering) - allows more signals
 USE_SIGNAL_PERCENTILE_FILTER = env("USE_SIGNAL_PERCENTILE_FILTER", "0") in ("1","true","TRUE")  # PURE_SCALPER: Disabled by default - percentile filter not used
 USE_THREE_STAGE_FILTER = env("USE_THREE_STAGE_FILTER", "1") in ("1","true","TRUE")  # PURE_SCALPER: Enabled by default but softened (microstructure only rejects garbage)
 SIGNAL_HISTORY_SIZE = env("SIGNAL_HISTORY_SIZE","100", int)  # Track last 100 signals for percentile calculation
 
 # Dynamic Threshold Adjustment (Phase 1: External Review Implementation)
-DYNAMIC_THRESHOLDS_ENABLED = env("DYNAMIC_THRESHOLDS_ENABLED", "1") in ("1","true","TRUE")  # Enabled - auto-adjusts based on win rate and market conditions
+# Dynamic threshold system (keep configurable but OFF by default for PURE_SCALPER)
+DYNAMIC_THRESHOLDS_ENABLED = env("DYNAMIC_THRESHOLDS_ENABLED", "0", int) == 1  # PURE_SCALPER: Disabled by default (0 = static thresholds)
 THRESHOLD_ADJUSTMENT_WINDOW = env("THRESHOLD_ADJUSTMENT_WINDOW", "50", int)  # Last N trades for win rate calculation
 THRESHOLD_ADJUSTMENT_STEP = env("THRESHOLD_ADJUSTMENT_STEP", "2", int)  # Points to adjust (relax/tighten) per adjustment
 WIN_RATE_RELAX_THRESHOLD = env("WIN_RATE_RELAX_THRESHOLD", "60.0", float)  # Relax thresholds if win rate > 60%
@@ -228,7 +249,7 @@ EXCHANGE_TIMEOUT_MS = env("EXCHANGE_TIMEOUT_MS","20000", int)
 EXCHANGE_RETRIES    = env("EXCHANGE_RETRIES","3", int)
 
 # Magic numbers extracted to constants
-MIN_STOP_DISTANCE_PCT = env("MIN_STOP_DISTANCE_PCT", "0.5", float) / 100.0  # 0.5% minimum stop distance
+MIN_STOP_DISTANCE_PCT = env("MIN_STOP_DISTANCE_PCT", "0.2", float) / 100.0  # 0.2% minimum stop distance (0.002 = 0.2%)
 TRAILING_STOP_ACTIVATION_PCT = env("TRAILING_STOP_ACTIVATION_PCT", "0.7", float)  # Activate trailing stop at 0.7% profit (lowered for faster activation)
 TRAILING_STOP_PCT = env("TRAILING_STOP_PCT", "50.0", float) / 100.0  # Trail stop to 50% of profit
 

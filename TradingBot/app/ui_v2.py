@@ -176,13 +176,18 @@ class UIv2:
         # Store snapshot for potential debug display
         self._last_snapshot = snapshot
         
-        # Update terminal size (in case window resized)
-        self._update_terminal_size()
+        # OPTIMIZATION: Update terminal size only occasionally (every 5 seconds) to reduce jitter
+        # Check terminal size only if we haven't checked recently
+        import time
+        if not hasattr(self, '_last_terminal_check') or (time.time() - self._last_terminal_check) > 5.0:
+            self._update_terminal_size()
+            self._last_terminal_check = time.time()
         
         # Build layout
         layout = self._build_layout(snapshot)
         
         # Update Live display (this overwrites the screen)
+        # CRITICAL: Single update call per render to prevent flicker
         self._live.update(layout, refresh=True)
     
     def _build_layout(self, snapshot: EngineSnapshot) -> Layout:
@@ -298,15 +303,33 @@ class UIv2:
         )
     
     def _build_signal_health_panel(self, snapshot: EngineSnapshot) -> Panel:
-        """Build SIGNAL HEALTH panel."""
-        # FIX: Use SignalHealth from snapshot (wired to real filter stats)
-        # This uses cumulative filter stats from [FILTER] scan#N logs
-        sig_health = snapshot.signal_health
-        total_signals = sig_health.signals_generated
-        signals_approved = sig_health.signals_approved
-        signals_rejected = sig_health.signals_rejected
-        pass_rate = sig_health.pass_rate
-        avg_score = sig_health.avg_signal_score
+        """
+        Build SIGNAL HEALTH panel.
+        
+        Data source: snapshot.signal_health (SignalHealth dataclass)
+        - signals_generated: Total signals generated (cumulative, from bot.filter_stats_cumulative)
+        - signals_approved: Signals that passed filter pipeline AND position manager (cumulative)
+        - signals_rejected: Rejected signals (signals_generated - signals_approved)
+        - pass_rate: Percentage of signals approved (0-100%)
+        - avg_signal_score: Running average of all signal scores (0-100)
+        
+        Updated in: bot.py scan_and_enter_signals() after each scan
+        """
+        # Defensive: Handle missing signal_health gracefully
+        if not hasattr(snapshot, 'signal_health') or snapshot.signal_health is None:
+            # Fallback to zero values if signal_health is missing
+            total_signals = 0
+            signals_approved = 0
+            signals_rejected = 0
+            pass_rate = 0.0
+            avg_score = 0.0
+        else:
+            sig_health = snapshot.signal_health
+            total_signals = sig_health.signals_generated or 0
+            signals_approved = sig_health.signals_approved or 0
+            signals_rejected = sig_health.signals_rejected or 0
+            pass_rate = sig_health.pass_rate or 0.0
+            avg_score = sig_health.avg_signal_score or 0.0
         
         content = Text()
         content.append(f"Signals: ", style="dim")
@@ -374,6 +397,11 @@ class UIv2:
         
         CRITICAL: Table rows are clipped to fit panel height.
         NO overflow into terminal.
+        
+        Data source: snapshot.open_positions (List[PositionSnapshot])
+        - Reads directly from bot.positions (position_registry._positions)
+        - Updated in real-time when positions are opened/closed
+        - Source: snapshot_builder.py line 424-536
         """
         table = Table(
             expand=True,
@@ -405,12 +433,14 @@ class UIv2:
         # Remaining lines for data rows
         max_rows = max(1, self.positions_height - 4)
         
-        if not snapshot.open_positions:
+        # Defensive: Handle missing open_positions gracefully
+        positions_list = getattr(snapshot, 'open_positions', None) or []
+        if not positions_list:
             # Empty state
             table.add_row("—", "—", "—", "—", "—", "—", "—", "—", "—", "—", "—", "—", "—", "—", style="dim")
         else:
             # Clip to max_rows (most important positions first, already sorted by snapshot_builder)
-            for pos in snapshot.open_positions[:max_rows]:
+            for pos in positions_list[:max_rows]:
                 # Symbol with unicorn emoji
                 if pos.is_unicorn:
                     symbol_display = f"🦄{pos.symbol[:5]}"
@@ -469,7 +499,7 @@ class UIv2:
                 )
         
         # Title with count
-        pos_count = len(snapshot.open_positions)
+        pos_count = len(positions_list)
         count_display = f"({pos_count})" if pos_count > 0 else "(0)"
         
         return Panel(
@@ -539,15 +569,24 @@ class UIv2:
         )
     
     def _build_signals_panel(self, snapshot: EngineSnapshot) -> Panel:
-        """Build SIGNAL QUEUE panel with FIXED height."""
+        """
+        Build SIGNAL QUEUE panel with FIXED height.
+        
+        Data source: snapshot.signal_queue (List[SignalItem])
+        - Shows recent rejected signals from bot.signal_history
+        - Updated in snapshot_builder.py line 620-632
+        - Source: bot.signal_history (deque, maxlen=20)
+        """
         content = Text()
         
         max_signals = max(1, self.bottom_height - 3)
         
-        if not snapshot.signal_queue:
+        # Defensive: Handle missing signal_queue gracefully
+        signal_queue_list = getattr(snapshot, 'signal_queue', None) or []
+        if not signal_queue_list:
             content.append("No signals in queue", style="dim")
         else:
-            for sig in snapshot.signal_queue[:max_signals]:
+            for sig in signal_queue_list[:max_signals]:
                 # Symbol (7 chars) | Score | Status | Reason (truncated)
                 symbol_display = sig.symbol[:7].ljust(7)
                 score_color = "green" if sig.score >= 70 else "yellow" if sig.score >= 60 else "red"
@@ -666,10 +705,16 @@ def render_ui_v2(snapshot: EngineSnapshot) -> None:
     
     For continuous display, use UIv2 class with context manager.
     
+    NOTE: This function is deprecated. Use UIv2 class with context manager instead.
+    This function may output to console, so it should NOT be used when UI is active.
+    
     Args:
         snapshot: EngineSnapshot from build_engine_snapshot()
     """
+    # DEPRECATED: This function should not be used in production
+    # Use UIv2 class with context manager instead for proper stdout/stderr redirection
     ui = UIv2()
     console = ui.console
     layout = ui._build_layout(snapshot)
+    # NOTE: This console.print will output to console - only use if UI is not active
     console.print(layout)

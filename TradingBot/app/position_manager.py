@@ -4,11 +4,13 @@ Implements real-world position-taking strategies with Kelly-adjusted sizing.
 """
 
 import time
+import math
 from typing import Optional, Dict, Tuple, Any
 from collections import defaultdict
 
 from .config import (
     RISK_PCT, LEVERAGE_BASE, MAX_CONCURRENT_POS, MAX_OPEN_POSITIONS, MAX_CONCURRENT_POS_MIN, MAX_CONCURRENT_POS_MAX,
+    MAX_ACCOUNT_RISK_PCT, RISK_PER_TRADE_PCT, MAX_CONCURRENT_POS_HARD,
     MAX_CAPITAL_PER_POS, TOTAL_RISK_BUDGET, MIN_RISK_PER_TRADE, MAX_RISK_PER_TRADE,
     USE_RANK_BASED_ALLOCATION, RPA_MIN_SIZE_MULT, RPA_MAX_SIZE_MULT, RPA_MIN_SIZE_USD, RPA_MAX_RISK_BUDGET_PCT,
     COOLDOWN_SEC, COOLDOWN_SAME_SYMBOL, COOLDOWN_AFTER_EXIT, COOLDOWN_DIFF_SYMBOL,
@@ -34,7 +36,7 @@ from .config import (
     MAX_LOSS_STREAK_HARD, LOSS_STREAK_CAUTION_LEVEL, LOSS_STREAK_AUTO_RESET_SEC,
     SCORE_AWARE_REPLACEMENT_ENABLED, SCORE_REPLACEMENT_MARGIN,
     LOSS_STREAK_DEFENSE_LEVEL, LOSS_STREAK_HARD_LEVEL, LOSS_STREAK_PAUSE_SEC, LOSS_STREAK_DECAY_SECONDS,
-    HIGH_SCORE_BYPASS
+    HIGH_SCORE_BYPASS, SYMBOL_CHURN_COOLDOWN_SEC
 )
 
 
@@ -60,6 +62,8 @@ class PositionManager:
         # Loss-streak state machine
         self.loss_streak_state = "normal"  # normal|caution|defense|pause
         self.loss_streak_unlock_ts = 0.0
+        # Symbol churn tracking: track last micro time_exit per symbol
+        self._symbol_churn = {}  # key: symbol, value: {"ts": float, "profit_atr": float}
     
     def calculate_position_size(
         self,
@@ -111,7 +115,12 @@ class PositionManager:
         stop_distance_pct = price_risk / entry_price
         
         # Ensure minimum stop distance
+        # Both LIVE and DRY: reject entries with too-tight stops (honest sandbox)
         if stop_distance_pct < MIN_STOP_DISTANCE_PCT:
+            # Reject entry - both LIVE and DRY behave the same
+            self.logger.info(
+                f"[RISK] stop_too_tight: stop_pct={stop_distance_pct*100:.4f}% < min={MIN_STOP_DISTANCE_PCT*100:.4f}% – entry rejected"
+            )
             return 0.0, 0.0, "stop_too_tight"
         
         # 1) Calculate current portfolio risk
@@ -265,6 +274,10 @@ class PositionManager:
         # OPTIMIZATION: Cache time once per validation
         now = cached_now if cached_now is not None else time.time()
         
+        # Check symbol churn cooldown (after basic global checks, before score filters)
+        if self.is_symbol_churn_paused(symbol, now, SYMBOL_CHURN_COOLDOWN_SEC):
+            return False, f"churn_pause_after_time_exit (symbol={symbol} cooloff={SYMBOL_CHURN_COOLDOWN_SEC}s)", None
+        
         # AUTO-RESET: Check if loss streak should be auto-reset (time-based)
         if AUTO_RESET_LOSS_STREAK_ENABLED and self.loss_streak > 0 and self.last_loss_time > 0:
             time_since_last_loss = now - self.last_loss_time
@@ -288,22 +301,42 @@ class PositionManager:
                 self.loss_streak = 0
                 self.last_loss_time = 0.0
         
-        # HARD MAX POSITION CAP: Strictly enforce MAX_OPEN_POSITIONS (no unicorn bypass)
-        # Unicorns still get priority in ranking, but cannot exceed hard cap
-        max_pos = MAX_OPEN_POSITIONS  # Hard cap - no bypass
+        # DYNAMIC MAX POSITION CAP: Based on risk budget (floor(MAX_ACCOUNT_RISK_PCT / RISK_PER_TRADE_PCT), clamped by MAX_CONCURRENT_POS_HARD)
+        # Unicorns still get priority in ranking, but cannot exceed dynamic cap
+        if equity is None or equity <= 0:
+            # Fallback to legacy cap if equity not available
+            max_pos = MAX_OPEN_POSITIONS
+        else:
+            max_pos = self.get_effective_max_positions(equity=equity)
         if current_positions >= max_pos:
-            return False, "RJ – max positions reached", None
+            return False, f"RJ – max positions reached ({current_positions}/{max_pos})", None
         
-        # Loss-streak handled via state machine with score bypass; no special LIVE-only behavior
+        # Loss-streak handled via state machine with score bypass
         # Normal validation path
         # OPTIMIZATION: Early exit for most common rejections first
-        # Loss-streak state machine gate (DRY_RUN parity)
+        # Loss-streak state machine gate
         adj_ok, size_factor, score_bonus, pause_reason = self.loss_streak_adjustments(
             score=(signal_score if signal_score is not None else (signal_strength * 100.0)),
             now_ts=now
         )
+        # loss-streak pause: LIVE still blocked, DRY_RUN only logs and continues
         if not adj_ok:
-            return False, pause_reason or "loss_streak_pause", None
+            # Re-use whatever DRY_RUN flag already exists in this module
+            # DRY_RUN is imported from .config at module level
+            is_dry_run = DRY_RUN
+            
+            if not is_dry_run:
+                # LIVE: keep existing behavior and reason string (e.g. "loss_streak_pause_900s")
+                return False, pause_reason or "loss_streak_pause", None
+            
+            # DRY_RUN: do NOT block; just keep the adjusted effective_min / score bonus from loss_streak_adjustments().
+            # Keep any existing logging hook (UIAdapter) if available, but avoid changing signatures.
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.info(
+                    "[RISK] Loss streak pause would trigger in LIVE (reason=%s) but is ignored in DRY_RUN for testing",
+                    pause_reason or "loss_streak_pause"
+                )
         # Enforce score bonus if provided
         # PERFORMANCE: MIN_SIGNAL_SCORE already imported at module level
         try:
@@ -358,7 +391,11 @@ class PositionManager:
         
         # Check position limit (use dynamic limit) - soft cap (risk budget is hard cap)
         # NOTE: Hard cap already checked above, this is for score-aware replacement
-        max_pos = self.get_dynamic_max_positions()
+        if equity is None or equity <= 0:
+            # Fallback to legacy cap if equity not available
+            max_pos = self.get_dynamic_max_positions()
+        else:
+            max_pos = self.get_effective_max_positions(equity=equity)
         if current_positions >= max_pos:
             # At max positions - check for score-aware replacement
             if (SCORE_AWARE_REPLACEMENT_ENABLED and 
@@ -499,6 +536,25 @@ class PositionManager:
             del self.cooldown_until[symbol]
         if symbol in self.last_entry_by_symbol:
             del self.last_entry_by_symbol[symbol]
+        if symbol in self._symbol_churn:
+            del self._symbol_churn[symbol]
+    
+    def is_symbol_churn_paused(self, symbol: str, now_ts: float, cooldown_sec: float) -> bool:
+        """
+        Check if symbol is in churn cooldown after a micro time_exit.
+        
+        Args:
+            symbol: Trading symbol
+            now_ts: Current timestamp
+            cooldown_sec: Cooldown duration in seconds
+        
+        Returns:
+            True if symbol is in churn cooldown, False otherwise
+        """
+        info = self._symbol_churn.get(symbol)
+        if not info:
+            return False
+        return (now_ts - info["ts"]) < cooldown_sec
     
     def get_entry_delay_ms(self, signal_strength: float, volatility: float = 0.0) -> int:
         """
@@ -556,13 +612,15 @@ class PositionManager:
             'total': entry_fee + exit_fee + slippage
         }
     
-    def record_exit(self, symbol: str, was_win: bool, pnl_pct: float = None):
+    def record_exit(self, symbol: str, was_win: bool, pnl_pct: float = None, exit_reason: Optional[str] = None, profit_atr: Optional[float] = None):
         """Record position exit and update loss streak. Set cooldown to prevent immediate re-entry.
         
         Args:
             symbol: Trading symbol
             was_win: Whether the trade was a winner
             pnl_pct: PnL percentage (optional, for auto-reset on decent winners)
+            exit_reason: Exit reason string (optional, for churn tracking)
+            profit_atr: Profit in ATR units (optional, for churn tracking)
         """
         now = time.time()
         self.last_exit_time = now
@@ -571,34 +629,84 @@ class PositionManager:
         from .logger import get_logger
         logger = get_logger("PositionManager")
         
-        if was_win:
-            old_streak = self.loss_streak
-            self.loss_streak = 0
-            self.last_loss_time = 0.0  # Clear last loss time on win
-            # Log streak reset on win
-            if old_streak > 0:
-                logger.info(
-                    f"[RISK] Loss streak reset to 0 after win (was {old_streak} losses, "
-                    f"pnl_pct={pnl_pct:.2f}% if available)"
-                )
-            # AUTO-RESET: Reset loss streak on decent winner (if enabled)
-            if (AUTO_RESET_LOSS_STREAK_ENABLED and 
-                pnl_pct is not None and 
-                pnl_pct >= AUTO_RESET_WINNER_PNL_THRESHOLD):
-                logger.info(
-                    f"[RISK] Loss streak reset due to decent winner (pnl_pct={pnl_pct:.2f}% >= "
-                    f"{AUTO_RESET_WINNER_PNL_THRESHOLD}%)"
-                )
-        else:
-            self.loss_streak += 1
-            self.last_loss_time = now  # Track time of last loss for auto-reset
-            # Log loss streak increment
+        # Determine if this is DRY_RUN
+        # DRY_RUN is imported from .config at module level
+        is_dry_run = DRY_RUN
+        
+        # Compute realized R if not already present
+        # Try to get from position if available, otherwise calculate from pnl_pct and stop distance
+        realized_R = None
+        if symbol in self.positions:
+            position = self.positions[symbol]
+            # Try to get max_r_reached or current_r from position
+            realized_R = position.get('max_r_reached') or position.get('current_r')
+            
+            # If not available, calculate from pnl_pct and stop distance
+            if realized_R is None and pnl_pct is not None:
+                entry_price = position.get('entry_price', 0)
+                stop_loss = position.get('stop_loss', 0)
+                if entry_price > 0 and stop_loss > 0:
+                    # Calculate stop distance as percentage
+                    side = position.get('side', 'long').lower()
+                    if side == 'long':
+                        stop_distance_pct = abs((entry_price - stop_loss) / entry_price)
+                    else:  # short
+                        stop_distance_pct = abs((stop_loss - entry_price) / entry_price)
+                    
+                    if stop_distance_pct > 0:
+                        # R = pnl_pct / stop_distance_pct (convert pnl_pct from % to decimal)
+                        realized_R = (pnl_pct / 100.0) / stop_distance_pct
+        
+        # 6.1: Scratches (|R| < 0.1) do NOT affect loss streak at all
+        if realized_R is not None and abs(realized_R) < 0.10:
+            # Keep optional debug log so we know scratches happened
             logger.info(
-                f"[RISK] Loss streak incremented to {self.loss_streak} "
-                f"(last_loss_time={now:.0f})"
+                f"[RISK] Scratch exit (|R|={realized_R:.3f} < 0.10) – not counted towards loss streak"
             )
-            # Recompute state and set pause timer if needed
-            self._recompute_loss_streak_state(now)
+            # Early return: do NOT increment loss_streak, do NOT change state
+            # Still set cooldown below
+        # 6.2: In DRY_RUN, completely disable loss-streak accumulation for testing
+        elif is_dry_run:
+            logger.info(
+                "[RISK] Loss streak update suppressed in DRY_RUN (would have %s).",
+                "incremented" if not was_win else "reset"
+            )
+            # Again: do not modify self.loss_streak or state; just continue to cooldown
+        # 6.3: LIVE mode – keep existing logic exactly as is
+        else:
+            if was_win:
+                old_streak = self.loss_streak
+                self.loss_streak = 0
+                self.last_loss_time = 0.0  # Clear last loss time on win
+                # Log streak reset on win
+                if old_streak > 0:
+                    logger.info(
+                        f"[RISK] Loss streak reset to 0 after win (was {old_streak} losses, "
+                        f"pnl_pct={pnl_pct:.2f}% if available)"
+                    )
+                # AUTO-RESET: Reset loss streak on decent winner (if enabled)
+                if (AUTO_RESET_LOSS_STREAK_ENABLED and 
+                    pnl_pct is not None and 
+                    pnl_pct >= AUTO_RESET_WINNER_PNL_THRESHOLD):
+                    logger.info(
+                        f"[RISK] Loss streak reset due to decent winner (pnl_pct={pnl_pct:.2f}% >= "
+                        f"{AUTO_RESET_WINNER_PNL_THRESHOLD}%)"
+                    )
+            else:
+                self.loss_streak += 1
+                self.last_loss_time = now  # Track time of last loss for auto-reset
+                # Log loss streak increment
+                logger.info(
+                    f"[RISK] Loss streak incremented to {self.loss_streak} "
+                    f"(last_loss_time={now:.0f})"
+                )
+                # Recompute state and set pause timer if needed
+                self._recompute_loss_streak_state(now)
+        
+        # Track micro time_exit churn (flat-ish exits that indicate symbol is not working)
+        if exit_reason and exit_reason.startswith("time_exit"):
+            if profit_atr is not None and abs(profit_atr) <= 0.25:
+                self._symbol_churn[symbol] = {"ts": now, "profit_atr": profit_atr}
         
         # Set cooldown after exit to prevent immediate re-entry (now 2 minutes, softened)
         # This helps prevent position accumulation without being too conservative
@@ -659,14 +767,23 @@ class PositionManager:
             return True, 0.5, 0.0, None
 
         if ls_state == "pause":
-            if now_ts < self.loss_streak_unlock_ts:
-                remaining = int(self.loss_streak_unlock_ts - now_ts)
-                return False, 0.0, 0.0, f"loss_streak_pause_{remaining}s"
+            # DRY_RUN override: soften global pause to 45s
+            if DRY_RUN:
+                dry_remaining = self.loss_streak_unlock_ts - now_ts
+                if dry_remaining > 45:
+                    return False, 0.0, 0.0, f"loss_streak_pause_dryrun_{int(dry_remaining)}s"
+                # If dry_remaining <= 45, fall through to end-of-pause logic
             else:
-                # End of pause: soften by 1 and move to defense
-                self.loss_streak = max(LOSS_STREAK_DEFENSE_LEVEL, self.loss_streak - 1)
-                self._recompute_loss_streak_state(now_ts)
-                return True, 0.5, 5.0, None  # resume in defense profile
+                # LIVE mode: keep full strict pause
+                if now_ts < self.loss_streak_unlock_ts:
+                    remaining = int(self.loss_streak_unlock_ts - now_ts)
+                    return False, 0.0, 0.0, f"loss_streak_pause_{remaining}s"
+                # If pause expired, fall through to end-of-pause logic
+            
+            # End of pause: soften by 1 and move to defense (applies to both DRY_RUN and LIVE)
+            self.loss_streak = max(LOSS_STREAK_DEFENSE_LEVEL, self.loss_streak - 1)
+            self._recompute_loss_streak_state(now_ts)
+            return True, 0.5, 5.0, None  # resume in defense profile
         elif ls_state == "defense":
             return True, 0.5, 5.0, None
         elif ls_state == "caution":
@@ -814,6 +931,30 @@ class PositionManager:
             'loss_streak_cooldown': loss_streak_cooldown,
             'active_count': len(symbol_cooldowns) + (1 if global_cooldown_remaining > 0 else 0) + (1 if exit_to_entry_remaining > 0 else 0)
         }
+    
+    def get_effective_max_positions(self, equity: float) -> int:
+        """
+        Dynamic position cap based on risk budget:
+        floor(MAX_ACCOUNT_RISK_PCT / RISK_PER_TRADE_PCT), clamped by MAX_CONCURRENT_POS_HARD.
+        
+        Args:
+            equity: Current account equity (used for validation, not calculation)
+        
+        Returns:
+            Effective maximum positions based on risk budget
+        """
+        total_risk = float(MAX_ACCOUNT_RISK_PCT)
+        per_trade = float(RISK_PER_TRADE_PCT)
+        hard_cap = int(MAX_CONCURRENT_POS_HARD)
+        
+        if per_trade <= 0:
+            return 0
+        
+        dyn_cap = int(math.floor(total_risk / per_trade))
+        if dyn_cap < 1:
+            dyn_cap = 1
+        
+        return max(1, min(dyn_cap, hard_cap))
     
     def get_dynamic_max_positions(self) -> int:
         """

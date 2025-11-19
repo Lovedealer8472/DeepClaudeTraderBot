@@ -386,26 +386,24 @@ class SignalGenerator:
             best_signal.score_components_raw = None
             best_signal.score_components_capped = None
         
-        # Calculate dynamic thresholds based on recent performance and market conditions
+        # Calculate dynamic thresholds (always called, but only used if DYNAMIC_THRESHOLDS_ENABLED is True)
         recent_trades_list = recent_trades if recent_trades else []
         btc_trend_value = btc_trend if btc_trend is not None else 0.0
         dynamic_score, dynamic_strength, dynamic_percentile = self._calculate_dynamic_thresholds(
             recent_trades_list, volatility_regime, btc_trend_value
         )
         
-        # Use dynamic thresholds if enabled, otherwise use regime-specific or base thresholds
+        # PURE_SCALPER: static thresholds by default.
+        # If DYNAMIC_THRESHOLDS_ENABLED is set, we can re-enable adaptive behavior later.
         if DYNAMIC_THRESHOLDS_ENABLED:
             min_score = dynamic_score
             min_strength = dynamic_strength
             percentile_threshold = dynamic_percentile
-        elif regime_config:
-            min_score = regime_config.min_signal_score
-            min_strength = regime_config.min_signal_strength
-            percentile_threshold = SIGNAL_PERCENTILE_THRESHOLD
         else:
-            min_score = MIN_SIGNAL_SCORE
+            # Static thresholds: use configured values only
+            min_score = float(MIN_SIGNAL_SCORE)
             min_strength = MIN_SIGNAL_STRENGTH
-            percentile_threshold = SIGNAL_PERCENTILE_THRESHOLD
+            percentile_threshold = 0.0  # percentile filter effectively off in LIVE/DRY
         
         # DIAGNOSTIC: Track filter rejections
         if not hasattr(self, '_filter_stats'):
@@ -426,13 +424,14 @@ class SignalGenerator:
             self._filter_stats['rejected_hard_min'] += 1
             return best_signal, f"RJ – score below minimum ({score_to_check:.1f} < {HARD_MIN_SCORE})"
         
-        # Check minimum score (0-100 scale) - use Scoring v2 MIN_SIGNAL_SCORE or existing min_score
-        effective_min_score = max(min_score, SCORING_V2_MIN_SCORE)
+        # Check minimum score (0-100 scale) using min_score (static or dynamic based on DYNAMIC_THRESHOLDS_ENABLED)
+        # This is the main entry gate score threshold (after scaling calibration).
+        effective_min_score = float(min_score)
         if score_to_check < effective_min_score:
             # Track rejected signal in history for percentile calculation
             self._add_to_history(symbol, best_signal.final_score, best_signal.strength)
             self._filter_stats['rejected_score'] += 1
-            return best_signal, f"Score too low ({score_to_check:.1f} < {effective_min_score})"
+            return best_signal, f"Score too low ({score_to_check:.1f} < {effective_min_score:.1f})"
         
         # Also check backward compatibility threshold
         if best_signal.strength < min_strength:

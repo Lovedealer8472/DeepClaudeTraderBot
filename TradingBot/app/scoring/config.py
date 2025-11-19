@@ -22,8 +22,13 @@ SCORE_MAX = 100.0
 BASE_SCORE_MIN = 0.0
 BASE_SCORE_MAX = 100.0
 
+# Scoring calibration: global multiplier applied to base score before bonuses.
+# 1.0 = old behavior, <1.0 deflates scores to kill "everything is 90+" fantasy.
+# Only scales the numeric score, not changing strategy logic or entry/exit rules.
+SCORING_BASE_SCALE = 0.90  # 90% of previous base (deflates fantasy but keeps good signals above threshold)
+
 # Percentile + score thresholds for final filtering
-# LIVE MODE: Moderate minimum score (72-73 for balanced scalper setups)
-MIN_SIGNAL_SCORE = 72.0        # LIVE MODE: minimum absolute score (72-73 range, allows more signals)
+# LIVE MODE: Moderate minimum score (74 for balanced scalper setups after scaling)
+MIN_SIGNAL_SCORE = 74.0        # LIVE MODE: minimum absolute score (74 for entry candidate threshold after scaling)
 SIGNAL_PERCENTILE_THRESHOLD = 0.0  # LIVE MODE: Disabled (0.0 = no percentile filtering) - allows more signals
 

@@ -12,6 +12,7 @@ Implements:
 import time
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
+from ..config import DRY_RUN, TIME_EXIT_BARS, DRY_SIMPLE_EXITS, DRY_SIMPLE_SL_R, DRY_SIMPLE_TP_R
 
 
 @dataclass
@@ -21,6 +22,76 @@ class ScalperExitAction:
     new_stop: Optional[float] = None
     exit_reason: Optional[str] = None
     exit_size_ratio: float = 1.0  # 1.0 = full exit
+
+
+def _is_dry_simple_exits() -> bool:
+    """
+    Check if DRY_RUN simple exits mode is enabled.
+    DRY sandbox mode: only hard SL and hard TP exits, no partials/trailing.
+    """
+    return bool(DRY_RUN and DRY_SIMPLE_EXITS)
+
+
+def _evaluate_simple_dry_exit(
+    position: Dict[str, Any],
+    current_price: float,
+    atr_pct: Optional[float],
+    side: str,
+    entry_price: float,
+    initial_stop: float
+) -> Optional[ScalperExitAction]:
+    """
+    DRY_RUN sandbox: only hard SL and hard TP exits based on R.
+    No partials, no trailing, no time-based micro scalps.
+    
+    Args:
+        position: Position dictionary
+        current_price: Current market price
+        atr_pct: ATR as percentage of price
+        side: "long" or "short"
+        entry_price: Entry price
+        initial_stop: Initial stop loss price
+    
+    Returns:
+        ScalperExitAction if exit needed, None otherwise
+    """
+    if not atr_pct or atr_pct <= 0:
+        atr_pct = 0.01
+    
+    # Calculate R-multiple based on initial stop distance
+    if initial_stop <= 0 or entry_price <= 0:
+        return None  # Can't calculate R without valid stop
+    
+    risk_per_unit = abs(entry_price - initial_stop)
+    if risk_per_unit <= 0:
+        return None
+    
+    # Calculate current R
+    if side == "long":
+        current_r = (current_price - entry_price) / risk_per_unit
+    else:  # short
+        current_r = (entry_price - current_price) / risk_per_unit
+    
+    # Hard stop loss at DRY_SIMPLE_SL_R or worse
+    sl_r = float(DRY_SIMPLE_SL_R)
+    if current_r <= sl_r:
+        return ScalperExitAction(
+            action="exit",
+            exit_reason=f"hard_sl_dry_simple R={current_r:.2f}",
+            exit_size_ratio=1.0
+        )
+    
+    # Hard take-profit at DRY_SIMPLE_TP_R or better
+    tp_r = float(DRY_SIMPLE_TP_R)
+    if current_r >= tp_r:
+        return ScalperExitAction(
+            action="exit",
+            exit_reason=f"hard_tp_dry_simple R={current_r:.2f}",
+            exit_size_ratio=1.0
+        )
+    
+    # Otherwise: hold (let hard SL protect if price moves against us)
+    return None
 
 
 def evaluate_scalper_trailing(
@@ -55,14 +126,6 @@ def evaluate_scalper_trailing(
         # Fallback to 1% if ATR not available
         atr_pct = 0.01
     
-    # Calculate profit in ATR units
-    if side == "long":
-        profit_pct = ((current_price - entry_price) / entry_price)
-        profit_atr = profit_pct / atr_pct
-    else:  # short
-        profit_pct = ((entry_price - current_price) / entry_price)
-        profit_atr = profit_pct / atr_pct
-    
     current_stop = position.get('stop_loss', 0)
     initial_stop = position.get('initial_stop_price', current_stop)
     if not initial_stop:
@@ -73,6 +136,42 @@ def evaluate_scalper_trailing(
             initial_stop = entry_price * (1.0 + 0.35 * atr_pct)
         position['initial_stop_price'] = initial_stop
         position['stop_loss'] = initial_stop
+    
+    # DRY_RUN simple exits: bypass all trailing/partial logic, use simple SL/TP only
+    if _is_dry_simple_exits():
+        # Check hard SL first (price hit stop)
+        if side == "long" and current_price <= current_stop:
+            return ScalperExitAction(
+                action="exit",
+                exit_reason="stop_loss_hit",
+                exit_size_ratio=1.0
+            )
+        elif side == "short" and current_price >= current_stop:
+            return ScalperExitAction(
+                action="exit",
+                exit_reason="stop_loss_hit",
+                exit_size_ratio=1.0
+            )
+        
+        # Use simple DRY exit logic (hard SL/TP in R-space)
+        return _evaluate_simple_dry_exit(
+            position=position,
+            current_price=current_price,
+            atr_pct=atr_pct,
+            side=side,
+            entry_price=entry_price,
+            initial_stop=initial_stop
+        )
+    
+    # LIVE/NORMAL path: full exit engine with trailing/partials
+    
+    # Calculate profit in ATR units
+    if side == "long":
+        profit_pct = ((current_price - entry_price) / entry_price)
+        profit_atr = profit_pct / atr_pct
+    else:  # short
+        profit_pct = ((entry_price - current_price) / entry_price)
+        profit_atr = profit_pct / atr_pct
     
     # 1. Structural Exit Overrides (hard exits regardless of trailing)
     structural_exit = _check_structural_exit(
@@ -85,16 +184,46 @@ def evaluate_scalper_trailing(
             exit_size_ratio=1.0
         )
     
-    # 2. Time-based exit (3-4 candles max for scalper)
-    max_bars = 4
-    if bars_in_trade >= max_bars:
-        # Check if position has meaningful profit
-        if profit_atr < 0.2:  # Less than 0.2 ATR profit after 4 bars
+    # 2. Time-based exit (more patient, only kill losers/zombies)
+    # Only consider time-exit once we've given the trade enough time
+    if bars_in_trade < TIME_EXIT_BARS:
+        # Too early to time-exit
+        pass
+    else:
+        # Calculate current R (profit in R units)
+        # profit_atr is already in ATR units, which approximates R for scalping
+        # For scalping, 1 ATR ≈ 1R (stop is typically ~0.35 ATR, so profit_atr ≈ R)
+        current_R = profit_atr  # Approximate: profit_atr ≈ R for scalping
+        
+        # Get peak R (best R seen so far) from position metadata
+        peak_R = position.get('max_r_reached', 0.0)
+        if peak_R is None:
+            peak_R = 0.0
+        
+        # Fallback: calculate peak_R from peak_price if available
+        if peak_R == 0.0:
+            peak_price = position.get('peak_price') if side == 'long' else position.get('trough_price')
+            if peak_price and entry_price > 0:
+                if side == "long":
+                    peak_profit_pct = ((peak_price - entry_price) / entry_price)
+                else:  # short
+                    peak_profit_pct = ((entry_price - peak_price) / entry_price)
+                peak_R = peak_profit_pct / atr_pct if atr_pct > 0 else 0.0
+        
+        # Only nuke if it's clearly a loser or a dead/zombie trade:
+        # LOSER: cut it if we're worse than -0.3R
+        is_clear_loser = current_R <= -0.30
+        
+        # ZOMBIE: if it never exceeded +0.3R and is still ≤ +0.1R, we give up
+        is_dead_trade = (peak_R < 0.30 and current_R <= 0.10)
+        
+        if is_clear_loser or is_dead_trade:
             return ScalperExitAction(
                 action="exit",
                 exit_reason=f"time_exit: {bars_in_trade} bars, profit={profit_atr:.2f}ATR",
                 exit_size_ratio=1.0
             )
+        # Everything else stays open for trailing / normal SL
     
     # 3. Micro Trailing Activation (+0.3 ATR)
     if profit_atr >= 0.3:

@@ -243,10 +243,11 @@ class StructuredLogger:
             backupCount=backup_count,
             mode='a'  # Append mode for rotation
         )
-        file_handler.setLevel(file_level)
+        file_handler.setLevel(logging.INFO)  # File handler at INFO level (DEBUG goes to file only if file_level is DEBUG, but we want compact INFO+)
+        # Very compact formatter for file handler
         file_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+            fmt='%(asctime)s|%(levelname).1s|%(message)s',
+            datefmt='%H:%M:%S'
         )
         file_handler.setFormatter(file_formatter)
         self.logger.addHandler(file_handler)
@@ -278,29 +279,84 @@ class StructuredLogger:
         self.log_file_path = log_path
         self.in_memory_buffer = in_memory_buffer
     
-    def debug(self, message: str, **context: Any):
+    def debug(self, message, *args, **kwargs):
         """Log debug message with optional context."""
-        self._log(logging.DEBUG, message, **context)
+        # Support both standard logging format (msg % args) and context kwargs
+        if args:
+            # Standard logging format: logger.info("Exit: %s", reason)
+            self.logger.debug(message, *args, **kwargs)
+        elif kwargs:
+            # Context format: logger.info("Exit", reason=reason)
+            self._log(logging.DEBUG, message, **kwargs)
+        else:
+            # Plain message: logger.info("Exit")
+            self.logger.debug(message)
     
-    def info(self, message: str, **context: Any):
+    def info(self, message, *args, **kwargs):
         """Log info message with optional context."""
-        self._log(logging.INFO, message, **context)
+        # Support both standard logging format (msg % args) and context kwargs
+        if args:
+            # Standard logging format: logger.info("Exit: %s", reason)
+            self.logger.info(message, *args, **kwargs)
+        elif kwargs:
+            # Context format: logger.info("Exit", reason=reason)
+            self._log(logging.INFO, message, **kwargs)
+        else:
+            # Plain message: logger.info("Exit")
+            self.logger.info(message)
     
-    def warning(self, message: str, **context: Any):
+    def warning(self, message, *args, **kwargs):
         """Log warning message with optional context."""
-        self._log(logging.WARNING, message, **context)
+        # Support both standard logging format (msg % args) and context kwargs
+        if args:
+            # Standard logging format: logger.warning("Exit: %s", reason)
+            self.logger.warning(message, *args, **kwargs)
+        elif kwargs:
+            # Context format: logger.warning("Exit", reason=reason)
+            self._log(logging.WARNING, message, **kwargs)
+        else:
+            # Plain message: logger.warning("Exit")
+            self.logger.warning(message)
     
-    def error(self, message: str, **context: Any):
+    def error(self, message, *args, **kwargs):
         """Log error message with optional context."""
-        self._log(logging.ERROR, message, **context)
+        # Support both standard logging format (msg % args) and context kwargs
+        if args:
+            # Standard logging format: logger.error("Exit: %s", reason)
+            self.logger.error(message, *args, **kwargs)
+        elif kwargs:
+            # Context format: logger.error("Exit", reason=reason)
+            self._log(logging.ERROR, message, **kwargs)
+        else:
+            # Plain message: logger.error("Exit")
+            self.logger.error(message)
     
-    def critical(self, message: str, **context: Any):
+    def critical(self, message, *args, **kwargs):
         """Log critical message with optional context."""
-        self._log(logging.CRITICAL, message, **context)
+        # Support both standard logging format (msg % args) and context kwargs
+        if args:
+            # Standard logging format: logger.critical("Exit: %s", reason)
+            self.logger.critical(message, *args, **kwargs)
+        elif kwargs:
+            # Context format: logger.critical("Exit", reason=reason)
+            self._log(logging.CRITICAL, message, **kwargs)
+        else:
+            # Plain message: logger.critical("Exit")
+            self.logger.critical(message)
     
-    def exception(self, message: str, **context: Any):
+    def exception(self, message, *args, **kwargs):
         """Log exception with traceback."""
-        self._log(logging.ERROR, message, exc_info=True, **context)
+        # Support both standard logging format (msg % args) and context kwargs
+        exc_info = kwargs.pop('exc_info', True)
+        if args:
+            # Standard logging format: logger.exception("Exit: %s", reason)
+            self.logger.exception(message, *args, exc_info=exc_info, **kwargs)
+        elif kwargs:
+            # Context format: logger.exception("Exit", reason=reason)
+            self._log(logging.ERROR, message, exc_info=exc_info, **kwargs)
+        else:
+            # Plain message: logger.exception("Exit")
+            self.logger.exception(message, exc_info=exc_info)
     
     def isEnabledFor(self, level: int) -> bool:
         """
@@ -593,6 +649,23 @@ def get_logger(name: str = "ScalperBot", enable_console: bool = False) -> Struct
         
         # Log initialization (to file only)
         _logger_instance.info(f"Logger initialized | log_file={_logger_instance.log_file_path}")
+    else:
+        # If logger already exists, update console handler based on enable_console
+        # Remove existing console handlers
+        console_handlers = [h for h in _logger_instance.logger.handlers if isinstance(h, logging.StreamHandler) and h.stream == sys.stdout]
+        for handler in console_handlers:
+            _logger_instance.logger.removeHandler(handler)
+        
+        # Add console handler if requested
+        if enable_console:
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.INFO)
+            console_formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            console_handler.setFormatter(console_formatter)
+            _logger_instance.logger.addHandler(console_handler)
     
     return _logger_instance
 

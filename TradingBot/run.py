@@ -117,77 +117,76 @@ async def main():
     logger = None
     bot = None
     
-    # STARTUP DIAGNOSTICS (console output OK before UI starts)
-    print("[STARTUP] Validating configuration...")
+    # STARTUP DIAGNOSTICS (console output OK before UI starts, but route to logger for consistency)
+    # Get logger early (before UI starts) - console output allowed here
+    try:
+        logger = get_logger("TradingBot", enable_console=True)  # Enable console ONLY for startup
+    except Exception:
+        # Fallback: use basic logging if logger init fails
+        import logging as py_logging
+        py_logging.basicConfig(level=py_logging.INFO, format='%(message)s')
+        logger = py_logging.getLogger("TradingBot")
+    
+    logger.info("[STARTUP] Validating configuration...")
     try:
         validate_and_exit_on_error()
-        print("[STARTUP] ✓ Configuration validated")
+        logger.info("[STARTUP] ✓ Configuration validated")
     except Exception as e:
-        print(f"[STARTUP] ✗ Configuration validation failed: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"[STARTUP] ✗ Configuration validation failed: {e}")
+        logger.exception("Configuration validation traceback:")
         sys.exit(1)
     
     # Single-instance guard
-    print("[STARTUP] Checking for existing instance...")
+    logger.info("[STARTUP] Checking for existing instance...")
     is_running, reason = check_single_instance(lock_file)
     if is_running:
-        print(f"[STARTUP] ✗ Another instance is already running: {reason}")
-        print("[STARTUP] If this is incorrect, delete run.lock and try again")
+        logger.error(f"[STARTUP] ✗ Another instance is already running: {reason}")
+        logger.error("[STARTUP] If this is incorrect, delete run.lock and try again")
         sys.exit(1)
     
     # Handle stale lock files
     if reason.startswith("stale"):
         # Allow override via environment variable
         if os.getenv("FORCE_START", "0") not in ("1", "true", "TRUE"):
-            print(f"[STARTUP] ⚠ Stale lock file detected ({reason})")
-            print("[STARTUP] Set FORCE_START=1 to override, or delete run.lock manually")
+            logger.warning(f"[STARTUP] ⚠ Stale lock file detected ({reason})")
+            logger.warning("[STARTUP] Set FORCE_START=1 to override, or delete run.lock manually")
             sys.exit(1)
         else:
-            print(f"[STARTUP] ⚠ Overriding stale lock file ({reason})")
+            logger.warning(f"[STARTUP] ⚠ Overriding stale lock file ({reason})")
             remove_lock_file(lock_file)
     
     # Create lock file
     if not create_lock_file(lock_file):
-        print("[STARTUP] ✗ Failed to create lock file")
+        logger.error("[STARTUP] ✗ Failed to create lock file")
         sys.exit(1)
     
-    # Get logger
-    print("[STARTUP] Initializing logger...")
-    try:
-        logger = get_logger("TradingBot")
-        print("[STARTUP] ✓ Logger initialized")
-    except Exception as e:
-        print(f"[STARTUP] ✗ Logger initialization failed: {e}")
-        import traceback
-        traceback.print_exc()
-        remove_lock_file(lock_file)
-        sys.exit(1)
-    
+    logger.info("[STARTUP] ✓ Logger initialized")
     logger.info("="*80)
     logger.info("TRADING BOT STARTING")
     logger.info("="*80)
     
-    print("[STARTUP] Creating bot instance...")
-    print("[STARTUP] UI will take over in 3 seconds...")
-    print("[STARTUP] If bot crashes, check logs/bot_*.log for details")
+    logger.info("[STARTUP] Creating bot instance...")
+    logger.info("[STARTUP] UI will take over in 3 seconds...")
+    logger.info("[STARTUP] If bot crashes, check logs/bot_*.log for details")
     
     try:
         bot = ScalperBot()
-        print("[STARTUP] ✓ Bot instance created")
+        logger.info("[STARTUP] ✓ Bot instance created")
     except Exception as e:
-        print(f"[STARTUP] ✗ Bot instance creation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        logger.exception("Bot instance creation failed")
+        logger.error(f"[STARTUP] ✗ Bot instance creation failed: {e}")
+        logger.exception("Bot instance creation traceback:")
         remove_lock_file(lock_file)
         sys.exit(1)
     
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     
+    # CRITICAL: Disable console output from logger NOW (before UI starts)
+    # Re-initialize logger with console disabled
+    logger = get_logger("TradingBot", enable_console=False)  # Disable console for UI safety
+    
     try:
-        print("[STARTUP] Starting bot.run()...")
+        logger.info("[STARTUP] Starting bot.run()...")
         await bot.run()
     except (KeyboardInterrupt, asyncio.CancelledError):
         # Restore stdout/stderr for safe logging

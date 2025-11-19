@@ -12,7 +12,7 @@ from .modules import (
     score_time_of_day,
     score_symbol_rating,
 )
-from .config import SCORE_CAPS, SCORE_MIN, SCORE_MAX
+from .config import SCORE_CAPS, SCORE_MIN, SCORE_MAX, SCORING_BASE_SCALE
 
 
 def build_score_components(ctx: SignalContext) -> ScoreComponents:
@@ -25,8 +25,17 @@ def build_score_components(ctx: SignalContext) -> ScoreComponents:
     Returns:
         ScoreComponents with raw (uncapped) values
     """
+    # Apply global calibration scale to base score (before bonuses are added)
+    # This deflates scores to prevent "everything is 90+" fantasy while keeping ranking intact
+    base = ctx.base_score * SCORING_BASE_SCALE
+    # Clamp to sane range
+    if base < 0.0:
+        base = 0.0
+    elif base > 100.0:
+        base = 100.0
+    
     return ScoreComponents(
-        base=ctx.base_score,
+        base=base,
         liquidity=score_liquidity(ctx),
         regime=score_regime(ctx),
         structure=score_structure(ctx),

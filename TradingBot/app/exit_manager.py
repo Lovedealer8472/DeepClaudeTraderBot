@@ -8,7 +8,7 @@ from typing import Optional, Dict, Tuple, Any
 from dataclasses import dataclass
 
 from .config import (
-    TAKER_FEE_RATE, SLIPPAGE_BPS, DRY_RUN,
+    TAKER_FEE_RATE, SLIPPAGE_BPS, DRY_RUN, DRY_SIMPLE_EXITS,
     TRAILING_STOP_ACTIVATION_PCT, TRAILING_STOP_PCT,
     WIDE_SPREAD_EXIT_THRESHOLD_BPS,
     USE_ATR_TRAILING_STOP, ATR_TRAILING_MULTIPLIER, ATR_TRAILING_MIN_DISTANCE_PCT,
@@ -1232,6 +1232,20 @@ class ExitManager:
         """
         # Update R metadata
         self.update_position_r_metadata(position, current_price, bar_closed)
+        
+        # DRY_RUN simple exits: bypass trailing/partial logic
+        if DRY_RUN and DRY_SIMPLE_EXITS:
+            # In DRY simple mode, exits are handled by evaluate_scalper_trailing
+            # Just check hard SL here as fallback
+            stop_loss = position.get('stop_loss')
+            if stop_loss:
+                side = position.get('side', '').lower()
+                if side == 'long' and current_price <= stop_loss:
+                    return True, "stop_loss_hit", current_price, 1.0
+                elif side == 'short' and current_price >= stop_loss:
+                    return True, "stop_loss_hit", current_price, 1.0
+            # Otherwise let scalper_exits handle simple DRY exits
+            return False, None, None, None
         
         # NEW: Check new trailing stop engine first (gets priority)
         if USE_NEW_TRAILING_ENGINE and self.trailing_engine:

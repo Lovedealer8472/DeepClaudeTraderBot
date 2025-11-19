@@ -15,7 +15,7 @@ from .config import (
     RETRY_DELAY_MULTIPLIER, MID_PRICE_FACTOR, BTC_TREND_WEAK_THRESHOLD,
     HIGH_VOLATILITY_MEDIAN_THRESHOLD, HIGH_VOLATILITY_P75_THRESHOLD,
     MAX_DRAWDOWN_PCT, DRAWDOWN_CIRCUIT_BREAKER_ENABLED, WHITELIST_SYMBOLS, MIN_24H_VOLUME_USDT,
-    MAX_CONCURRENT_POS, USE_RICH_UI,
+    MAX_CONCURRENT_POS, MAX_OPEN_POSITIONS, USE_RICH_UI,
     UNICORN_SCORE_THRESHOLD, UNICORN_PROTOCOL_ENABLED,
     STARTUP_DELAY_SEC, PRS_MIN_AGE_MIN
 )
@@ -1171,6 +1171,8 @@ class ScalperBot:
         rejected_risk = 0  # Rejected by risk/cooldown state
         rejected_capacity = 0  # Rejected by max positions
         passed_filters = 0  # Signals that passed all filters
+        entry_candidates = 0  # Signals that passed position manager check (considered for entry)
+        entries_opened_this_scan = 0  # Entries actually opened this scan
         
         # DIAGNOSTIC: Track filtering stages
         signals_pass_score_filter = 0
@@ -1698,10 +1700,8 @@ class ScalperBot:
                         self.signal_history.append(signal_record)
                         continue
                 
-                # PURE_SCALPER: Filter passed (or disabled) - count it
-                passed_filters += 1
-                
-                # Filter passed - apply structure confluence boost to score if available
+                # Filter pipeline passed - apply structure confluence boost to score if available
+                # NOTE: Do NOT increment passed_filters here - wait until position manager check passes
                 if structure_confluence and structure_confluence.score_boost > 0:
                     # Boost the final_score by structure confluence
                     signal.final_score = min(100.0, signal.final_score + structure_confluence.score_boost)
@@ -1817,9 +1817,14 @@ class ScalperBot:
                     elif "risk" in reason_str or "cooldown" in reason_str or "loss_streak" in reason_str or "drawdown" in reason_str:
                         rejected_risk += 1
                     
-                    # DEBUG: Log rejection reason (important for debugging why bot isn't trading)
-                    max_pos = self.cfg.MAX_OPEN_POSITIONS
-                    self.logger.warning(
+                    # DEBUG: Log rejection reason (demoted to DEBUG to reduce spam)
+                    # Use dynamic cap for logging if equity available, else fallback to legacy
+                    try:
+                        equity = self.equity_now()
+                        max_pos = self.position_manager.get_effective_max_positions(equity=equity) if equity > 0 else self.cfg.MAX_OPEN_POSITIONS
+                    except Exception:
+                        max_pos = self.cfg.MAX_OPEN_POSITIONS
+                    self.logger.debug(
                         f"[ENTRY_REJECTED] symbol={symbol} side={signal.side} "
                         f"score={signal.final_score:.1f} reason={reason_str} "
                         f"current_positions={current_positions}/{max_pos}"
@@ -1834,12 +1839,21 @@ class ScalperBot:
                     # We may skip extra logging for startup / SCW, but we must ALWAYS skip entry:
                     continue
                 
-                # PURE_SCALPER: Signal passed all checks - ready for entry
+                # PURE_SCALPER: Signal passed all checks (filter pipeline + position manager) - ready for entry
                 # (Entry will be attempted below)
+                # CRITICAL: Only count as "passed" if signal passed BOTH filter pipeline AND position manager check
+                # This ensures Signal Health panel shows accurate pass rate (signals ready for entry)
+                passed_filters += 1  # Signal passed filter pipeline AND position manager check
+                entry_candidates += 1  # Track signals that passed position manager check
                 
-                # DEBUG: Log that we're about to attempt entry
-                max_pos = self.cfg.MAX_OPEN_POSITIONS
-                self.logger.info(
+                # DEBUG: Log that we're about to attempt entry (demoted to DEBUG to reduce spam)
+                # Use dynamic cap for logging if equity available, else fallback to legacy
+                try:
+                    equity = self.equity_now()
+                    max_pos = self.position_manager.get_effective_max_positions(equity=equity) if equity > 0 else self.cfg.MAX_OPEN_POSITIONS
+                except Exception:
+                    max_pos = self.cfg.MAX_OPEN_POSITIONS
+                self.logger.debug(
                     f"[ENTRY_ATTEMPT] symbol={symbol} side={signal.side} "
                     f"score={signal.final_score:.1f} can_enter={can_enter} "
                     f"current_positions={current_positions}/{max_pos}"
@@ -1937,7 +1951,7 @@ class ScalperBot:
                                 
                                 if success and event_created:
                                     record_loop_exit(replacement_symbol, "EXIT")
-                                    self.position_manager.record_exit(replacement_symbol, was_win, pnl_pct=pnl_pct)
+                                    self.position_manager.record_exit(replacement_symbol, was_win, pnl_pct=pnl_pct, exit_reason=None, profit_atr=None)
                                 
                                 current_positions = len(self.positions)
                             elif "Invalid position" in str(exit_result.error or ""):
@@ -2044,6 +2058,7 @@ class ScalperBot:
                     # METRICS
                     self.metrics['entries_attempted'] += 1
                     self.metrics['entries_opened'] += 1
+                    entries_opened_this_scan += 1  # Track entries opened this scan
                     self.position_manager.record_entry(entry_symbol)
                     
                     entry_price = result.filled_price or signal.entry_price
@@ -2158,8 +2173,7 @@ class ScalperBot:
                         result.error if hasattr(result, "error") and result.error else "Unknown error"
                     )
                     self.logger.error(
-                        f"❌ Entry failed ❌ | symbol={entry_symbol} | side={entry_side} | "
-                        f"error={error_msg}"
+                        f"[E] entry_fail sym={entry_symbol} side={entry_side} msg={error_msg[:80]}"
                     )
         
         # Track scan completion
@@ -2215,20 +2229,31 @@ class ScalperBot:
             best_score = max(loop_stats['scores']) if loop_stats['scores'] else 0.0
             avg_score = sum(loop_stats['scores']) / len(loop_stats['scores']) if loop_stats['scores'] else 0.0
             
-            # PURE_SCALPER: Build filter summary line
-            # Format: [FILTER] scan#N sig=23 pass=3 RJ(score=10, pct=0, micro=5, risk=0, cap=5)
+            # Compact scan summary: [S]#N sig=N pass=N rj=N top=reason
+            # Find top rejection reason
+            top_reject_reason = "none"
+            reject_counts = {
+                'score': rejected_score,
+                'pct': rejected_percentile,
+                'micro': rejected_micro,
+                'risk': rejected_risk,
+                'cap': rejected_capacity
+            }
+            if any(reject_counts.values()):
+                top_reject_reason = max(reject_counts.items(), key=lambda x: x[1])[0]
+            
+            total_rejected = rejected_score + rejected_percentile + rejected_micro + rejected_risk + rejected_capacity
+            
+            # Compact summary line (< 100 chars)
             summary = (
-                f"[FILTER] scan#{scan_num} "
-                f"sig={signals_found} "
-                f"pass={passed_filters} "
-                f"RJ(score={rejected_score}, pct={rejected_percentile}, micro={rejected_micro}, risk={rejected_risk}, cap={rejected_capacity})"
+                f"[S]#{scan_num} sig={signals_found} pass={passed_filters} "
+                f"rj={total_rejected} top={top_reject_reason}"
             )
             
-            # Add score info if signals found
-            if loop_stats['signals'] > 0:
-                summary += f" | best={best_score:.1f} avg={avg_score:.1f}"
+            # Log compact summary to file (INFO level)
+            self.logger.info(summary)
             
-            # Log single summary line to buffer (for UI LOG panel)
+            # Also add to UI buffer (for UI LOG panel)
             log_buffer = get_log_buffer()
             log_buffer.append(
                 datetime.now(),
@@ -2288,6 +2313,10 @@ class ScalperBot:
         
         # FIX: Update cumulative filter stats for Signal Health panel
         # Wire the real filter stats from [FILTER] scan#N log to Signal Health
+        # CRITICAL: These stats feed the Signal Health panel and [FILTER] log
+        # - signals_found: Total signals generated (passed signal generator checks)
+        # - passed_filters: Signals that passed filter pipeline AND position manager check (ready for entry)
+        # - signals_rejected: Signals that were rejected (signals_found - passed_filters)
         self.filter_stats_cumulative['signals_total'] += signals_found
         self.filter_stats_cumulative['signals_passed'] += passed_filters
         self.filter_stats_cumulative['signals_rejected'] += (signals_found - passed_filters)
@@ -2297,6 +2326,12 @@ class ScalperBot:
             for score in loop_stats['scores']:
                 self.filter_stats_cumulative['avg_score_sum'] += score
                 self.filter_stats_cumulative['avg_score_count'] += 1
+        
+        # DEBUG: Single aggregated log per scan showing signal flow
+        self.logger.debug(
+            f"[DEBUG] entries_for_scan raw_signals={signals_found} filtered={passed_filters} "
+            f"entry_candidates={entry_candidates} opened={entries_opened_this_scan}"
+        )
     
     async def monitor_and_exit_positions(self) -> None:
         """Monitor open positions and exit when stop-loss or take-profit is hit."""
@@ -2519,8 +2554,11 @@ class ScalperBot:
                         )
             
             # Dynamic trailing stop evaluation (centralized in ExitPipeline) - fallback
+            # Skip in DRY simple exits mode (no partials/trailing)
             trailing_action = None
-            if hasattr(self, 'exit_pipeline') and self.exit_pipeline and not scalper_action:
+            from .config import DRY_SIMPLE_EXITS
+            if (hasattr(self, 'exit_pipeline') and self.exit_pipeline and not scalper_action and 
+                not (DRY_RUN and DRY_SIMPLE_EXITS)):
                 trailing_action = self.exit_pipeline.evaluate_trailing(
                     symbol=symbol,
                     position=position,
@@ -2825,7 +2863,27 @@ class ScalperBot:
                     # Record exit in position manager (only for full exits)
                     if exit_size_pct >= 1.0:
                         pnl_pct_for_manager = (exit_result.net_pnl / self.equity_now() * 100) if exit_result.net_pnl is not None else None
-                        self.position_manager.record_exit(symbol, was_win, pnl_pct=pnl_pct_for_manager)
+                        # Calculate profit_atr for churn tracking (if time_exit)
+                        profit_atr = None
+                        if reason and reason.startswith("time_exit"):
+                            # Try to extract from reason string: "time_exit: 4 bars, profit=0.00ATR"
+                            import re
+                            match = re.search(r'profit=([\d\.-]+)ATR', reason)
+                            if match:
+                                try:
+                                    profit_atr = float(match.group(1))
+                                except (ValueError, AttributeError):
+                                    pass
+                            # Fallback: calculate from position data if available
+                            if profit_atr is None and entry_price > 0 and exit_result.exit_price > 0:
+                                atr_pct = position.get('atr_pct', None)
+                                if atr_pct and atr_pct > 0:
+                                    if position_side.lower() == 'long':
+                                        profit_pct = ((exit_result.exit_price - entry_price) / entry_price)
+                                    else:
+                                        profit_pct = ((entry_price - exit_result.exit_price) / entry_price)
+                                    profit_atr = profit_pct / atr_pct
+                        self.position_manager.record_exit(symbol, was_win, pnl_pct=pnl_pct_for_manager, exit_reason=reason, profit_atr=profit_atr)
                     
                     # METRICS: exits by reason
                     try:
@@ -2876,11 +2934,11 @@ class ScalperBot:
                             f"[EXIT] {symbol} skipped: market price unavailable | reason={reason}"
                         )
                     else:
-                        # Other errors (API timeout, connection issues, etc.) - always log
-                        if len(error_msg) > 25:
-                            error_msg = error_msg[:22] + "..."
+                        # Other errors (API timeout, connection issues, etc.) - log compact format
+                        error_type = type(exit_result.error).__name__ if exit_result.error else "Unknown"
+                        error_msg_short = str(exit_result.error)[:80] if exit_result.error else "Unknown error"
                         self.logger.error(
-                            f"{time_str}  EXIT_FAILED {symbol_short} {error_msg}"
+                            f"[E] exit_fail sym={symbol_short} type={error_type} msg={error_msg_short}"
                         )
         
         # SELF-CHECK: Verify that every successful exit/partial-exit produced exactly one DecisionEvent
@@ -3026,6 +3084,21 @@ class ScalperBot:
             ui_adapter = UIAdapter(enable_print_interception=True)
             ui_adapter.start()
         
+        # CRITICAL: Remove ALL console handlers from logger BEFORE UI starts
+        # This prevents any logger messages from appearing in console
+        if USE_RICH_UI:
+            import logging
+            # Remove console handlers from all loggers
+            root_logger = logging.getLogger()
+            for handler in root_logger.handlers[:]:
+                if isinstance(handler, logging.StreamHandler) and handler.stream in (sys.stdout, sys.stderr):
+                    root_logger.removeHandler(handler)
+            
+            # Remove console handlers from bot's logger
+            for handler in self.logger.logger.handlers[:]:
+                if isinstance(handler, logging.StreamHandler) and handler.stream in (sys.stdout, sys.stderr):
+                    self.logger.logger.removeHandler(handler)
+        
         if USE_RICH_UI:
             if UI_MODE == "v2":
                 # Use new UI v2 with snapshot builder (FULLY STATIC, NO SCROLLING)
@@ -3033,14 +3106,25 @@ class ScalperBot:
                     from .ui_v2 import UIv2
                     from .snapshot_builder import build_engine_snapshot
                     
-                    # Log BEFORE UI starts (will go to file logger)
-                    self.logger.info("[UI] Starting UI v2 (fully static TUI dashboard)...")
+                    # CRITICAL: Suppress stdout/stderr IMMEDIATELY before UI starts
+                    # Redirect to /dev/null (or NUL on Windows) to prevent any output
+                    import io
+                    if os.name == 'nt':
+                        # Windows: Use NUL device
+                        null_stream = io.open(os.devnull, 'w', encoding='utf-8')
+                    else:
+                        # Unix: Use /dev/null
+                        null_stream = io.open(os.devnull, 'w', encoding='utf-8')
+                    
+                    # Redirect stdout/stderr BEFORE UI initialization
+                    sys.stdout = null_stream
+                    sys.stderr = null_stream
                     
                     # Start UI v2 (this enters screen mode and redirects stdout/stderr)
                     ui_v2_instance = UIv2()
                     ui_v2_instance.__enter__()
                     
-                    # Initial render
+                    # Initial render (this will be the first thing visible)
                     initial_snapshot = build_engine_snapshot(self, debug=False)
                     ui_v2_instance.render(initial_snapshot)
                     
@@ -3057,17 +3141,28 @@ class ScalperBot:
                 # Use legacy UI (ui_rich.py + ui_runtime.py)
                 try:
                     from .ui_runtime import RichUIRuntime, create_initial_state
+                    
+                    # CRITICAL: Suppress stdout/stderr IMMEDIATELY before UI starts
+                    import io
+                    if os.name == 'nt':
+                        null_stream = io.open(os.devnull, 'w', encoding='utf-8')
+                    else:
+                        null_stream = io.open(os.devnull, 'w', encoding='utf-8')
+                    
+                    sys.stdout = null_stream
+                    sys.stderr = null_stream
 
-                    self.logger.info("[UI] Starting Rich UI runtime (legacy mode)...")
                     initial_state = create_initial_state(self)
                     rich_ui_runtime = RichUIRuntime()
                     rich_ui_runtime.start(initial_state)
-                    self.logger.info("[UI] Rich UI runtime started successfully")
                 except (ImportError, Exception) as e:
+                    sys.stdout = original_stdout
+                    sys.stderr = original_stderr
                     self.logger.warning(f"[UI] Rich UI (legacy) failed, using plain UI: {type(e).__name__}: {e}", exc_info=True)
                     rich_ui_runtime = None
         else:
-            self.logger.info("[UI] Rich UI disabled, using plain UI")
+            # Plain UI mode - no suppression needed
+            pass
         
         next_universe = 0
         next_signal_scan = 0
