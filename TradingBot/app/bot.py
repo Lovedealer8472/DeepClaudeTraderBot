@@ -3664,7 +3664,7 @@ class ScalperBot:
         # or a reconciliation failure. Either way: verify protection or add it.
         if not hasattr(self, '_last_naked_audit'):
             self._last_naked_audit = 0
-        if monitor_now - self._last_naked_audit > 30:
+        if monitor_now - self._last_naked_audit > 10:  # Every 10s (was 30s) — minimize naked windows
             self._last_naked_audit = monitor_now
             try:
                 raw_audit = await asyncio.wait_for(
@@ -3703,8 +3703,8 @@ class ScalperBot:
                     qty = float(pos.get('contracts', 0))
                     entry = float(pos.get('entryPrice', 0))
                     close_side = 'sell' if side == 'long' else 'buy'
-                    real_sl = round(entry * (0.982 if side == 'long' else 1.018), 4)
-                    real_tp = round(entry * (1.018 if side == 'long' else 0.982), 4)
+                    from .config import MIN_STOP_DISTANCE_PCT; _d = MIN_STOP_DISTANCE_PCT / 100.0; real_sl = round(entry * ((1 - _d) if side == 'long' else (1 + _d)), 4)
+                    real_tp = round(entry * ((1 + _d) if side == 'long' else (1 - _d)), 4)
 
                     if normalized in tracked_symbols:
                         # Bot tracks this position — verify its protection is real, not just a sentinel
@@ -3923,35 +3923,53 @@ class ScalperBot:
                         entry = float(p.get('entryPrice', 0))
                         close_side = 'sell' if side == 'long' else 'buy'
 
-                        # Test if position has closePosition SL/TP orders via -4130 trick.
-                        # Use REAL protection prices (1.8%) — test IS the placement if order missing.
-                        sl_price = round(entry * (0.982 if side == 'long' else 1.018), 4)
-                        tp_price = round(entry * (1.018 if side == 'long' else 0.982), 4)
+                        # ALWAYS place fresh SL/TP at config distance — never trust stale orders.
+                        # Old closePosition orders from previous sessions may be at wrong prices.
+                        # Placing new ones at correct distance replaces any stale orders atomically.
+                        from .config import MIN_STOP_DISTANCE_PCT
+                        _dist = MIN_STOP_DISTANCE_PCT / 100.0  # Convert pct to decimal
+                        sl_price = entry * (1 - _dist) if side == 'long' else entry * (1 + _dist)
+                        tp_price = entry * (1 + _dist) if side == 'long' else entry * (1 - _dist)
                         has_sl = False
                         has_tp = False
                         try:
                             await self.exchange_wrapper.create_order(sym, 'STOP_MARKET', close_side, contracts, None,
                                 {'stopPrice': sl_price, 'closePosition': 'true'})
+                            has_sl = True
                         except Exception as e:
                             if '4130' in str(e):
-                                has_sl = True
+                                has_sl = True  # Same price already exists
+                            else:
+                                self.logger.error(f"[STARTUP] SL placement failed for {sym}: {e}")
                         try:
                             await self.exchange_wrapper.create_order(sym, 'TAKE_PROFIT_MARKET', close_side, contracts, None,
                                 {'stopPrice': tp_price, 'closePosition': 'true'})
+                            has_tp = True
                         except Exception as e:
                             if '4130' in str(e):
-                                has_tp = True
+                                has_tp = True  # Same price already exists
+                            else:
+                                self.logger.error(f"[STARTUP] TP placement failed for {sym}: {e}")
 
-                        # Test placed SL/TP at correct 1.8% prices if they didn't exist.
-                        # Whether -4130 fired (pre-existing) or order was just placed, position is protected.
-                        status = "has SL+TP" if (has_sl and has_tp) else "SL/TP placed"
+                        # If protection failed, close the position — can't trade naked
+                        if not (has_sl and has_tp):
+                            self.logger.critical(f"[STARTUP] {sym} UNPROTECTABLE — closing position")
+                            try:
+                                await self.exchange_wrapper.create_order(sym, 'market', close_side, contracts, None,
+                                    {'reduceOnly': 'true'})
+                            except Exception as ce:
+                                self.logger.critical(f"[STARTUP] {sym} close also failed: {ce}")
+                            continue
+
+                        status = "SL+TP placed"
                         normalized = self.exchange_wrapper.normalize_symbol(sym) if hasattr(self.exchange_wrapper, 'normalize_symbol') else sym
                         self.logger.warning(
                             f"[STARTUP] {normalized} {side} {contracts} — {status}, reconciling to tracking")
                         self.positions[normalized] = {
                             'symbol': normalized, 'side': side, 'size': contracts,
                             'entry_price': entry, 'entry_time': time.time(),
-                            'sl_order_id': 'RECONCILED', 'tp_order_id': 'RECONCILED',
+                            'sl_order_id': 'EXISTS' if has_sl else 'PENDING',
+                            'tp_order_id': 'EXISTS' if has_tp else 'PENDING',
                             'initial_stop_price': sl_price, 'stop_loss': sl_price,
                             'take_profit': tp_price,
                             'signal_score': 50,
