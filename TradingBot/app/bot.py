@@ -3888,6 +3888,22 @@ class ScalperBot:
         
         await self.init_exchange()
 
+        # Pre-initialize lightweight exchange for position monitoring.
+        # Done at startup to avoid network calls inside the critical monitor path.
+        try:
+            import ccxt.async_support as ccxt_async
+            self._lightweight_ex = ccxt_async.binanceusdm({
+                'apiKey': self.exchange_wrapper.api_key,
+                'secret': self.exchange_wrapper.api_secret,
+                'enableRateLimit': True,
+                'timeout': 10000,
+            })
+            self._lightweight_ex_created = time.time()
+            self.logger.info("[STARTUP] Lightweight exchange initialized")
+        except Exception as e:
+            self.logger.warning(f"[STARTUP] Lightweight exchange init failed: {e}")
+            self._lightweight_ex = None
+
         # START CLEAN: reconcile stale positions on exchange BEFORE main loop.
         # The bot starts with empty position tracking — anything on exchange is a leftover.
         # Protection orders (SL/TP) are ALWAYS real regardless of DRY_RUN mode,
@@ -4098,9 +4114,9 @@ class ScalperBot:
                 if time.time() - self._last_monitor_run >= 10.0:
                     self._last_monitor_run = time.time()
                     try:
-                        await asyncio.wait_for(self.monitor_and_exit_positions(), timeout=15.0)
+                        await asyncio.wait_for(self.monitor_and_exit_positions(), timeout=30.0)
                     except asyncio.TimeoutError:
-                        self.logger.error("[TIMEOUT] monitor_and_exit_positions() hung")
+                        self.logger.error("[TIMEOUT] monitor_and_exit_positions() hung (30s limit)")
                     except Exception as e:
                         self.logger.error(f"[MONITOR_ERROR] {type(e).__name__}: {e}")
                 
