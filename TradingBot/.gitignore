@@ -107,3 +107,9 @@ strategy_manager.py
 replay_runner.py
 analyze_dry_exits.py
 pytest.ini
+bot.pid
+.env.live
+launch.bat
+launcher.bat
+app/data/
+python/

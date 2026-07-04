@@ -10,6 +10,12 @@ class SymbolStats:
     symbol: str
     vol_quote: float = 0.0
     pct_change_24h: float = 0.0
+    pct_change_15m: float = 0.0
+    open_interest: float = 0.0
+    oi_change_pct: float = 0.0  # Open interest change (stored for next cycle comparison)
+    funding_rate: float = 0.0  # Current funding rate
+    taker_buy_ratio: float = 0.5  # Taker buy vol / total taker vol
+    long_short_ratio: float = 1.0  # Global long/short account ratio
     bid: float = 0.0
     ask: float = 0.0
     last: float = 0.0
@@ -147,7 +153,12 @@ class DynamicUniverse:
         
         if force_full_rotation:
             # OPTIMIZATION: Pre-filter candidates before scoring
-            candidates = [(s, st) for s, st in self.stats.items() if quality_filter(st)]
+            candidates = []
+            for s, st in self.stats.items():
+                passed = quality_filter(st)
+                if passed:
+                    candidates.append((s, st))
+            
             # Full rotation: rank all symbols and take top N
             ranked = sorted(
                 [(s, self.score(st)) for s, st in candidates],
