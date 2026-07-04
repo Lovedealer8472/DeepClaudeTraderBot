@@ -5,6 +5,7 @@ Pandas-based computations for detecting bigger-picture context and reversal sign
 
 import pandas as pd
 import numpy as np
+from .ta import rsi_wilder, atr_wilder, adx_wilder, ema_series
 from typing import Dict, Optional, Tuple, Any
 from dataclasses import dataclass
 
@@ -530,7 +531,7 @@ def compute_all_features(
 
 # Helper functions for technical indicators
 
-def _ema(prices: np.ndarray, period: int) -> np.ndarray:
+def _ema(prices: np.ndarray, period: int) -> np.ndarray:  # DEPRECATED: use ta.ema_series()
     """Exponential Moving Average."""
     if len(prices) < period:
         return np.array([])
@@ -542,7 +543,7 @@ def _ema(prices: np.ndarray, period: int) -> np.ndarray:
     return ema[period-1:]
 
 
-def _sma(prices: np.ndarray, period: int) -> np.ndarray:
+def _sma(prices: np.ndarray, period: int) -> np.ndarray:  # DEPRECATED: kept for compatibility
     """Simple Moving Average."""
     if len(prices) < period:
         return np.array([])
@@ -604,7 +605,7 @@ def _adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int) -> n
     return adx
 
 
-def _rsi(prices: np.ndarray, period: int) -> np.ndarray:
+def _rsi(prices: np.ndarray, period: int) -> np.ndarray:  # DEPRECATED: use ta.rsi_wilder()
     """Relative Strength Index."""
     if len(prices) < period + 1:
         return np.array([])

@@ -1,5 +1,6 @@
 """
 Technical Indicators - RSI, EMA, ATR calculations for signal scoring.
+NOTE: Canonical implementations now in app/ta.py. This file kept for backward compat.
 OPTIMIZED: Added caching to reduce redundant calculations.
 """
 
