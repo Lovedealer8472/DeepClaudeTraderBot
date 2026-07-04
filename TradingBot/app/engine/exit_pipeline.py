@@ -171,10 +171,21 @@ class TrailingStopEngine:
                 position['sl_moved_to_be'] = True
             # Logging handled at ExitPipeline level to avoid spam
         
+        # TIME-BASED TRAIL TIGHTENING (research-backed)
+        entry_time = position.get('entry_time', now_ts)
+        bars_elapsed = position.get('bars_in_trade', 0)
+        if bars_elapsed <= 0:
+            hours_elapsed = (now_ts - entry_time) / 3600.0
+            bars_elapsed = max(1, int(hours_elapsed))
+            position['bars_in_trade'] = bars_elapsed
+        trail_mult = 1.5 if bars_elapsed <= 2 else (1.0 if bars_elapsed <= 5 else 0.6)
+
         def should_progress() -> bool:
-            if peak_r - state.get('last_update_r', 0.0) >= self.config.min_r_increment:
+            # PEAK-CONFIRMED RATCHET: require meaningful extension before locking
+            min_ext = max(0.15, 0.25 * trail_mult)
+            if peak_r - state.get('last_update_r', 0.0) >= min_ext:
                 return True
-            if now_ts - state.get('last_update_ts', 0.0) >= self.config.min_update_seconds:
+            if trail_mult <= 0.6 and peak_r > state.get('last_update_r', -999):
                 return True
             return False
         
@@ -183,7 +194,7 @@ class TrailingStopEngine:
             state['partial_1_taken'] = True
             action.partial_actions.append((self.config.partial_1_size, "trailing_partial_1r"))
             position['partial_exit_done'] = True
-            # Move stop closer but still below entry for LONG (above for SHORT)
+            # Stop guard after partial (below entry for LONG, above for SHORT)
             desired = entry_price - (multiplier * self.config.partial_1_sl_offset_r * risk_per_unit)
             update_stop(desired, "partial_1_guard")
         
@@ -424,8 +435,14 @@ class ExitPipeline:
                 "Invalid position size (zero or negative)",
                 "Invalid entry price (zero or negative)",
                 "Position already closed",
+                "ReduceOnly Order is rejected",  # -2022: position already closed by exchange
                 "invalid_limit_price",
                 "invalid_price"
+            ]
+            # Errors that mean the position is definitively gone — clean up tracking
+            position_gone_errors = [
+                "Position already closed",
+                "ReduceOnly Order is rejected",
             ]
             
             # Special handling for trailing stop exits - fallback to market if limit fails
@@ -455,7 +472,89 @@ class ExitPipeline:
                 return False
             
             is_expected = any(expected in error_msg for expected in expected_errors)
-            
+            position_gone = any(gone in error_msg for gone in position_gone_errors)
+
+            if position_gone:
+                # "Position already closed" or "ReduceOnly Order is rejected"
+                # — but this can be a FALSE POSITIVE (-2022 can fire for other reasons).
+                # VERIFY against the exchange before cleaning up tracking.
+                verified_gone = False
+                try:
+                    import asyncio
+                    await asyncio.sleep(0.5)
+                    pos_check = await exchange.fetch_positions([symbol])
+                    still_open = any(
+                        float(p.get('contracts', 0)) > 0
+                        for p in (pos_check if isinstance(pos_check, list) else [pos_check])
+                    )
+                    verified_gone = not still_open
+                    if still_open:
+                        self.logger.warning(
+                            f"[GHOST_EXIT] {symbol} -2022 was FALSE POSITIVE! Position still open on exchange. "
+                            f"Will retry exit differently."
+                        )
+                        # DON'T remove tracking — position is still alive
+                        # Try a direct market close as fallback
+                        try:
+                            pos_details = self.position_registry.positions.get(symbol, {})
+                            close_side = 'sell' if pos_details.get('side', 'long') == 'long' else 'buy'
+                            qty = abs(float(pos_details.get('size', 0)))
+                            if qty > 0:
+                                await exchange.create_order(
+                                    symbol, 'market', close_side, qty, None,
+                                    {'reduceOnly': 'true'}
+                                )
+                                # Check again after market close
+                                await asyncio.sleep(1)
+                                pos_check2 = await exchange.fetch_positions([symbol])
+                                still_open2 = any(
+                                    float(p.get('contracts', 0)) > 0
+                                    for p in (pos_check2 if isinstance(pos_check2, list) else [pos_check2])
+                                )
+                                if not still_open2:
+                                    verified_gone = True
+                                    self.logger.info(f"[GHOST_EXIT] {symbol} closed via market fallback")
+                        except Exception as fallback_err:
+                            self.logger.error(f"[GHOST_EXIT] {symbol} fallback close failed: {fallback_err}")
+                except Exception as verify_err:
+                    self.logger.error(f"[GHOST_EXIT] {symbol} verification failed: {verify_err} — assuming still open")
+
+                if not verified_gone:
+                    # Position still exists — DO NOT clean up. Let next cycle handle it.
+                    # But mark it so we don't infinite loop on the same -2022
+                    if symbol in self.position_registry.positions:
+                        self.position_registry.positions[symbol]['ghost_exit_count'] = \
+                            self.position_registry.positions[symbol].get('ghost_exit_count', 0) + 1
+                    return False
+
+                # VERIFIED: Position is really gone
+                self.logger.info(
+                    f"Exit confirmed (exchange): {symbol} reason={request.reason} "
+                    f"— position already closed"
+                )
+                # Remove from position registry so we don't retry
+                self.position_registry.remove(symbol)
+                # Record PnL from the position data we have
+                if bot_instance and symbol in bot_instance.positions:
+                    pos = bot_instance.positions[symbol]
+                    entry_px = pos.get('entry_price', 0)
+                    exit_px = pos.get('current_price', entry_px)
+                    side = pos.get('side', 'long')
+                    size = pos.get('size', 0)
+                    pnl = ((exit_px - entry_px) * size) if side == 'long' else ((entry_px - exit_px) * size)
+                    bot_instance.realized_pnl_total += pnl
+                    if pnl > 0:
+                        bot_instance.win_count += 1
+                        bot_instance.gross_win += pnl
+                    else:
+                        bot_instance.loss_count += 1
+                        bot_instance.gross_loss += abs(pnl)
+                    bot_instance.logger.info(
+                        f"EXIT: {symbol} | exchange_close | size={size} | "
+                        f"price={exit_px:.2f} | pnl={pnl:.2f}"
+                    )
+                return True  # Treat as success — position is gone
+
             if is_expected:
                 # Expected error - log as debug only, don't count as failure
                 self.logger.debug(
