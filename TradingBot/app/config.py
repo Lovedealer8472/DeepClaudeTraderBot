@@ -493,3 +493,16 @@ def safe_write_json(path, data):
         except (ImportError, Exception):
             # Silently fail if logger not available (shouldn't happen)
             pass
+
+
+# ── CONFIG VALIDATION ──
+def validate_config():
+    """Validate critical config values. Returns list of warnings."""
+    warnings = []
+    if COOLDOWN_SEC < 0: warnings.append("COOLDOWN_SEC < 0 — entries never blocked")
+    if LEVERAGE_BASE <= 0: warnings.append("LEVERAGE_BASE <= 0 — zero-size positions")
+    if MIN_LEVERAGE > MAX_LEVERAGE: warnings.append("MIN_LEVERAGE > MAX_LEVERAGE")
+    if MIN_SPREAD_BPS > MAX_SPREAD_BPS: warnings.append("MIN_SPREAD_BPS > MAX_SPREAD_BPS")
+    if MIN_RISK_PER_TRADE > MAX_RISK_PER_TRADE: warnings.append("MIN_RISK_PER_TRADE > MAX_RISK_PER_TRADE")
+    if MAX_DRAWDOWN_PCT <= 0: warnings.append("MAX_DRAWDOWN_PCT <= 0 — circuit breaker may not trigger")
+    return warnings

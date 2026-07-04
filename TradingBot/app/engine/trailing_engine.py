@@ -27,7 +27,7 @@ class TrailingResult:
     peak_r: Optional[float] = None
 
 
-class TrailingStopEngine:
+class TrailingStopEngine:  # NOTE: duplicate of exit_pipeline.py:77 — controlled by USE_NEW_TRAILING_ENGINE
     """
     Dynamic R-based trailing stop engine.
     
