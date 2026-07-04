@@ -2346,8 +2346,23 @@ class ScalperBot:
                     f"entry_price={signal.entry_price:.6f} stop_loss={scalper_stop_loss:.6f}"
                 )
 
-                # REMOVED: Individual entry logs (tracked via DecisionEvent in decision_event.py)
-                # Unicorn and regular entry logs now appear in Recent Activity panel via DecisionEvent
+                # PRE-ENTRY PROTECTION CUSHION CHECK (Deep Research #7)
+                # Binance validates SL/TP against current MARK_PRICE. If the stop is too
+                # close, -2021 rejects it. Pre-validate locally to avoid wasted attempts.
+                # Research: no fixed minimum distance published — must compute our own buffer.
+                _ref_price = getattr(stats, 'mark', 0.0) or getattr(stats, 'last', 0.0)
+                if _ref_price > 0 and signal.stop_loss > 0:
+                    if entry_side == 'long':
+                        _cushion_pct = (_ref_price - signal.stop_loss) / _ref_price
+                    else:
+                        _cushion_pct = (signal.stop_loss - _ref_price) / _ref_price
+                    _min_cushion = 0.005  # 0.5% minimum — covers tick size + spread + transport jitter
+                    if _cushion_pct < _min_cushion:
+                        self.logger.warning(
+                            f"[PRE-CHECK] {entry_symbol} stop too close to market "
+                            f"({_cushion_pct*100:.2f}% < {_min_cushion*100:.1f}%) — skipping cycle"
+                        )
+                        continue  # Don't even try — would get -2021
 
                 result = await self.order_manager.enter_position(
                     symbol=entry_symbol,
@@ -2444,7 +2459,7 @@ class ScalperBot:
                     tp_id = None
                     close_side = "sell" if entry_side == "long" else "buy"
 
-                    for attempt in range(15):
+                    for attempt in range(3):  # 3 attempts over 1.5s — was 15 over 7.5s (excessive per research)
                         await asyncio.sleep(0.5)
                         # Try placing SL (or verify existing via -4130)
                         if not sl_ok:
@@ -2478,7 +2493,7 @@ class ScalperBot:
 
                     if not (sl_ok and tp_ok):
                         # Failed to protect — close position. DO NOT TRACK (position never added).
-                        self.logger.critical(f"[UNPROTECTABLE] {entry_symbol} SL={sl_ok} TP={tp_ok} after 15 attempts — CLOSING")
+                        self.logger.critical(f"[UNPROTECTABLE] {entry_symbol} SL={sl_ok} TP={tp_ok} after 3 attempts — CLOSING")
                         for close_i in range(5):
                             try:
                                 await self.exchange_wrapper.exchange.create_order(
