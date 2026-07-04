@@ -10,6 +10,7 @@ SCORE_CAPS: Dict[str, Tuple[float, float]] = {
     "portfolio":     (-15.0, 5.0),   # Keep as-is
     "time_of_day":   (-3.0, 3.0),   # Small range
     "symbol_rating": (-3.0, 3.0),   # Modest effect
+    "order_flow":    (-5.0, 5.0),   # OB imbalance + OI + taker + L/S + absorption
 }
 
 # Global score bounds
@@ -29,6 +30,6 @@ SCORING_BASE_SCALE = 0.90  # 90% of previous base (deflates fantasy but keeps go
 
 # Percentile + score thresholds for final filtering
 # LIVE MODE: Moderate minimum score (74 for balanced scalper setups after scaling)
-MIN_SIGNAL_SCORE = 74.0        # LIVE MODE: minimum absolute score (74 for entry candidate threshold after scaling)
+MIN_SIGNAL_SCORE = 30.0        # Relaxed — 3-factor conviction checklist is the real gate now
 SIGNAL_PERCENTILE_THRESHOLD = 0.0  # LIVE MODE: Disabled (0.0 = no percentile filtering) - allows more signals
 

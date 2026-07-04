@@ -30,6 +30,8 @@ llm_tuning_log.csv
 trades_audit.csv
 *.csv
 data/
+!app/data/
+!data/history/
 ohlcv_cache.db
 
 # IDE

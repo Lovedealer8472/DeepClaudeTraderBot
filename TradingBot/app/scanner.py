@@ -194,24 +194,26 @@ class SymbolScanner:
                 try:
                     ohlcv = self.bot.replay_feed.get_ohlcv(symbol, timeframe='1m', limit=100)
                     if ohlcv and len(ohlcv) >= 20:  # Need at least 20 candles for RSI
-                        from .indicators import calculate_rsi, calculate_ema, calculate_atr
+                        from .indicators import calculate_rsi, calculate_ema, calculate_atr, calculate_adx, calculate_efficiency_ratio
                         # Extract close prices
                         closes = [candle[4] for candle in ohlcv]  # close is index 4
                         highs = [candle[2] for candle in ohlcv]  # high is index 2
                         lows = [candle[3] for candle in ohlcv]  # low is index 3
-                        
+
                         # Calculate indicators
                         rsi = calculate_rsi(closes, period=14)
                         ema20 = calculate_ema(closes, period=20)
                         ema50 = calculate_ema(closes, period=50)
                         ema100 = calculate_ema(closes, period=100) if len(closes) >= 100 else None
                         atr = calculate_atr(highs, lows, closes, period=14)
-                        
+                        adx = calculate_adx(highs, lows, closes, period=14)
+                        er = calculate_efficiency_ratio(closes, period=20)
+
                         # Calculate ATR as percentage of price
                         atr_pct = None
                         if atr and closes and closes[-1] > 0:
                             atr_pct = (atr / closes[-1]) * 100.0
-                        
+
                         # Calculate pct_change_24h from OHLCV (last 24 hours = 1440 1m candles, use last 100)
                         pct_change_24h = 0.0
                         if len(closes) >= 2:
@@ -220,10 +222,10 @@ class SymbolScanner:
                             last_close = closes[-1]
                             if first_close > 0:
                                 pct_change_24h = ((last_close - first_close) / first_close) * 100.0
-                        
+
                         # Update stats_dict with calculated pct_change_24h
                         stats_dict['pct_change_24h'] = pct_change_24h
-                        
+
                         indicators = {
                             'rsi': rsi,
                             'ema20': ema20,
@@ -231,14 +233,61 @@ class SymbolScanner:
                             'ema100': ema100,
                             'atr': atr,
                             'atr_pct': atr_pct,
+                            'adx': adx if adx is not None else 20.0,  # default to neutral (20 = not trending)
+                            'er': er if er is not None else 0.5,  # Efficiency Ratio (0-1), 0.5 = neutral
                         }
                 except Exception as e:
                     self.logger.debug(f"Failed to calculate indicators for {symbol} in replay: {e}")
                     indicators = None
+                else:
+                    # Store indicators in bot's cache for downstream use (ADX gate, exit checks)
+                    if hasattr(self.bot, 'indicators_cache'):
+                        self.bot.indicators_cache[symbol] = indicators
             else:
-                # LIVE MODE: Get indicators from cache
-                if hasattr(self.bot, 'indicators_cache'):
-                    indicators = self.bot.indicators_cache.get(symbol)
+                # LIVE MODE: Fetch OHLCV from exchange, calculate indicators
+                if not hasattr(self.bot, '_live_ohlcv_cache'):
+                    self.bot._live_ohlcv_cache = {}
+                cache = self.bot._live_ohlcv_cache
+                now_ts = time.time()
+                # Only fetch if not cached or stale (>60s)
+                if symbol not in cache or (now_ts - cache[symbol][0]) > 60:
+                    try:
+                        ohlcv = self.bot.exchange.fetch_ohlcv(symbol, '1m', limit=100)
+                        if ohlcv and len(ohlcv) >= 20:
+                            cache[symbol] = (now_ts, ohlcv)
+                    except Exception:
+                        pass
+                # Calculate indicators from cached OHLCV
+                cached = cache.get(symbol)
+                if cached:
+                    ohlcv = cached[1]
+                    try:
+                        from .indicators import calculate_rsi, calculate_ema, calculate_atr, calculate_adx, calculate_efficiency_ratio
+                        closes = [c[4] for c in ohlcv]
+                        highs = [c[2] for c in ohlcv]
+                        lows = [c[3] for c in ohlcv]
+                        rsi = calculate_rsi(closes, period=14)
+                        ema20 = calculate_ema(closes, period=20)
+                        ema50 = calculate_ema(closes, period=50)
+                        atr = calculate_atr(highs, lows, closes, period=14)
+                        adx = calculate_adx(highs, lows, closes, period=14)
+                        er = calculate_efficiency_ratio(closes, period=20)
+                        atr_pct = (atr / closes[-1]) * 100.0 if atr and closes[-1] > 0 else None
+                        pct_change_24h = ((closes[-1] - closes[0]) / closes[0]) * 100.0 if closes[0] > 0 else 0.0
+                        stats_dict['pct_change_24h'] = pct_change_24h
+                        indicators = {
+                            'rsi': rsi,
+                            'ema20': ema20,
+                            'ema50': ema50,
+                            'atr': atr,
+                            'atr_pct': atr_pct,
+                            'adx': adx if adx is not None else 20.0,
+                            'er': er if er is not None else 0.5,
+                        }
+                        if hasattr(self.bot, 'indicators_cache'):
+                            self.bot.indicators_cache[symbol] = indicators
+                    except Exception:
+                        pass
             
             # 7) Generate signal
             signal = await self.bot.signal_generator.generate_signal(

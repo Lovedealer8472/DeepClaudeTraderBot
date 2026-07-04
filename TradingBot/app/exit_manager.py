@@ -372,14 +372,7 @@ class ExitManager:
             # The PRS system considers trend alignment, volatility, age, and PnL
             # to make market-aware exit decisions instead of blind time limits.
             
-            # Log warning if position is very old (for debugging, but don't force exit)
-            if position_age_sec >= 7200:  # 2 hours
-                from .logger import get_logger
-                logger = get_logger("ExitManager")
-                logger.warning(
-                    f"Position {symbol or 'unknown'} is very old ({position_age_sec/60:.1f} min), "
-                    f"but exit decision will be made by PRS system"
-                )
+            # Position age tracked by bot.py hard max-age exit — no spam needed here
         
         # Get regime-specific parameters
         if regime_config:

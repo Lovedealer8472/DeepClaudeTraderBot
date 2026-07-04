@@ -69,8 +69,9 @@ def build_signal_context(
     spread_bps = symbol_stats.get('spread_bps', 9999)
     spread_pct = spread_bps / 10000.0  # Convert bps to percentage
     
-    # Calculate depth from orderbook
+    # Calculate depth and orderbook imbalance from orderbook
     depth_top_usd = 0.0
+    orderbook_imbalance = 0.5  # Neutral default
     if orderbook:
         bids = orderbook.get('bids', [])
         asks = orderbook.get('asks', [])
@@ -78,7 +79,7 @@ def build_signal_context(
             best_bid = bids[0][0] if bids else 0
             best_ask = asks[0][0] if asks else 0
             mid_price = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else 0
-            
+
             if mid_price > 0:
                 # Depth within 10 bps (0.1%) of mid
                 depth_window = mid_price * 0.001
@@ -91,10 +92,19 @@ def build_signal_context(
                     if abs(price - best_ask) <= depth_window
                 )
                 depth_top_usd = min(bid_depth, ask_depth)
-    
-    # ATR and HTF ADX
-    atr_pct = indicators.get('atr_pct') if indicators else 0.01  # Default 1%
-    htf_adx = advanced_features.htf_adx_14 if advanced_features else 20.0  # Default
+                # Orderbook imbalance: >0.5 = bid-heavy (buy pressure), <0.5 = ask-heavy
+                total_near = bid_depth + ask_depth
+                if total_near > 0:
+                    orderbook_imbalance = bid_depth / total_near
+
+    # ATR and HTF ADX — try indicators dict first, then advanced_features, then default
+    atr_pct = indicators.get('atr_pct') if indicators else 0.01
+    if advanced_features and advanced_features.htf_adx_14:
+        htf_adx = advanced_features.htf_adx_14
+    elif indicators and indicators.get('adx'):
+        htf_adx = indicators.get('adx')
+    else:
+        htf_adx = 20.0  # Neutral default
     
     # Structure / pattern flags
     htf_trend_dir = advanced_features.htf_trend_dir if advanced_features else 0
@@ -117,21 +127,57 @@ def build_signal_context(
     sfp_bottom = advanced_features.sfp_bottom if advanced_features else False
     dist_from_vwap = advanced_features.dist_from_vwap if advanced_features else 0.0
     
-    # Portfolio stats
-    open_positions_same_sector = 0  # TODO: Track sectors if available
+    # Portfolio stats — count positions with similar base asset or high BTC correlation
+    open_positions_same_sector = 0
+    if bot_positions:
+        base = symbol.split('/')[0] if '/' in symbol else symbol
+        for pos_sym, pos in bot_positions.items():
+            if pos_sym == symbol:
+                continue
+            pos_base = pos_sym.split('/')[0] if '/' in pos_sym else pos_sym
+            # Same sector = first 2 chars match (e.g., "SOL" and "SOLANA" are different)
+            # or position side correlation with BTC trend suggests same risk factor
+            if pos_base[:2] == base[:2] or abs(corr_to_btc_24h) > 0.85:
+                open_positions_same_sector += 1
     corr_to_btc_24h = symbol_stats.get('btc_correlation', 0.0)
-    
-    # Symbol rating (from historical or defaults)
+
+    # Symbol rating — use reversal score as proxy for historical quality
     symbol_rating = 0.0
     if advanced_features:
-        # Use advanced features as proxy for rating
-        # Higher score = better rating
-        if advanced_features.reversal_score_long > 20 or advanced_features.reversal_score_short > 20:
-            symbol_rating = 5.0  # Good
-        elif advanced_features.reversal_score_long > 10 or advanced_features.reversal_score_short > 10:
-            symbol_rating = 2.0  # Decent
-        # Default is 0.0
-    
+        rev_long = getattr(advanced_features, 'reversal_score_long', 0) or 0
+        rev_short = getattr(advanced_features, 'reversal_score_short', 0) or 0
+        best_rev = max(rev_long, rev_short)
+        if best_rev > 25:
+            symbol_rating = 6.0
+        elif best_rev > 15:
+            symbol_rating = 3.0
+        elif best_rev > 8:
+            symbol_rating = 1.5
+    # OI change and funding rate from stats (dict or object)
+    _get = lambda k, d: symbol_stats.get(k, d) if isinstance(symbol_stats, dict) else getattr(symbol_stats, k, d)
+    oi_change_pct = _get('oi_change_pct', 0.0)
+    funding_rate = _get('funding_rate', 0.0)
+
+    # Taker buy/sell ratio and long/short ratio from stats (fetched per-candidate)
+    taker_buy_ratio = _get('taker_buy_ratio', 0.5)
+    long_short_ratio = _get('long_short_ratio', 1.0)
+
+    # Absorption score: bid depth ÷ price movement.
+    # High bid depth + dropping price = someone absorbing sell pressure = reversal ahead.
+    # Range 0-1: 0=no absorption, 1=strong absorption signal.
+    absorption_score = 0.0
+    if orderbook and orderbook_imbalance > 0.5:  # Bid-heavy book
+        pct_change = symbol_stats.get('pct_change', 0.0) or 0.0
+        if pct_change < 0:  # Price dropping despite bid-heavy book
+            # Normalize: deeper bids + bigger drop = stronger absorption
+            bid_depth = orderbook.get('bids', [[0, 0]])[0][1] if orderbook.get('bids') else 0
+            absorption_score = min(1.0, (bid_depth / max(abs(pct_change), 0.01)) / 1_000_000)
+    elif orderbook and orderbook_imbalance < 0.5:  # Ask-heavy book
+        pct_change = symbol_stats.get('pct_change', 0.0) or 0.0
+        if pct_change > 0:  # Price rising despite ask-heavy book
+            ask_depth = orderbook.get('asks', [[0, 0]])[0][1] if orderbook.get('asks') else 0
+            absorption_score = min(1.0, (ask_depth / max(abs(pct_change), 0.01)) / 1_000_000)
+
     return SignalContext(
         symbol=symbol,
         side=side,  # type: ignore
@@ -157,6 +203,12 @@ def build_signal_context(
         dist_from_vwap=dist_from_vwap,
         open_positions_same_sector=open_positions_same_sector,
         corr_to_btc_24h=corr_to_btc_24h,
-        symbol_rating=symbol_rating
+        symbol_rating=symbol_rating,
+        orderbook_imbalance=orderbook_imbalance,
+        oi_change_pct=oi_change_pct,
+        funding_rate=funding_rate,
+        taker_buy_ratio=taker_buy_ratio,
+        long_short_ratio=long_short_ratio,
+        absorption_score=absorption_score,
     )
 

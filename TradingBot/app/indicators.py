@@ -152,6 +152,121 @@ def calculate_atr(highs: List[float], lows: List[float], closes: List[float], pe
     return atr
 
 
+def calculate_adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    """
+    Calculate Average Directional Index (ADX).
+
+    ADX > 25 = trending market (directional)
+    ADX < 20 = choppy/ranging market (good for mean-reversion scalping)
+
+    This is the single most important filter for a scalper grid — it tells you
+    whether your mean-reversion strategy will print (ADX < 20) or get steamrolled (ADX > 25).
+
+    Args:
+        highs: List of high prices (most recent last)
+        lows: List of low prices (most recent last)
+        closes: List of closing prices (most recent last)
+        period: ADX period (default 14)
+
+    Returns:
+        ADX value or None if insufficient data
+    """
+    if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
+        return None
+
+    # Calculate True Range
+    tr_values = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i-1]),
+            abs(lows[i] - closes[i-1])
+        )
+        tr_values.append(tr)
+
+    # Calculate +DM and -DM
+    plus_dm = []
+    minus_dm = []
+    for i in range(1, len(highs)):
+        up_move = highs[i] - highs[i-1]
+        down_move = lows[i-1] - lows[i]
+
+        if up_move > down_move and up_move > 0:
+            plus_dm.append(up_move)
+        else:
+            plus_dm.append(0.0)
+
+        if down_move > up_move and down_move > 0:
+            minus_dm.append(down_move)
+        else:
+            minus_dm.append(0.0)
+
+    # Use Wilder's smoothing (EMA-based, simpler than the original Wilder's method)
+    # First value: simple average over period
+    atr = sum(tr_values[:period]) / period
+    smoothed_plus_dm = sum(plus_dm[:period]) / period
+    smoothed_minus_dm = sum(minus_dm[:period]) / period
+
+    # Smooth subsequent values
+    alpha = 1.0 / period
+    for i in range(period, len(tr_values)):
+        atr = (tr_values[i] * alpha) + (atr * (1 - alpha))
+        smoothed_plus_dm = (plus_dm[i] * alpha) + (smoothed_plus_dm * (1 - alpha))
+        smoothed_minus_dm = (minus_dm[i] * alpha) + (smoothed_minus_dm * (1 - alpha))
+
+    if atr == 0:
+        return None
+
+    # Calculate +DI and -DI
+    plus_di = (smoothed_plus_dm / atr) * 100.0
+    minus_di = (smoothed_minus_dm / atr) * 100.0
+
+    # Calculate DX and ADX
+    di_sum = plus_di + minus_di
+    if di_sum == 0:
+        return 0.0
+
+    dx = abs(plus_di - minus_di) / di_sum * 100.0
+
+    # ADX is a smoothed average of DX — for simplicity we return DX directly
+    # (a single DX value is a good enough proxy for "is the market trending right now")
+    return dx
+
+
+def calculate_efficiency_ratio(prices: List[float], period: int = 20) -> Optional[float]:
+    """
+    Kaufman Efficiency Ratio — measures price directionality.
+
+    ER = abs(net_change) / sum_of_absolute_bar_changes
+
+    ER ≈ 1.0: price moves in straight line (strong trend — skip for mean-reversion)
+    ER ≈ 0.0: price zigzags (chop/range — good for mean-reversion scalping)
+
+    Per Kaufman (1995) and pupedator/binance-futures-ai-bot:
+    ER < 0.20 = "price going nowhere" (too noisy even for mean-reversion)
+    ER > 0.35 = trending (dangerous for mean-reversion — stay out)
+    0.20–0.35 = sweet spot for range trading
+
+    Args:
+        prices: List of closing prices (most recent last)
+        period: Lookback period (default 20)
+
+    Returns:
+        Efficiency Ratio (0.0–1.0) or None if insufficient data
+    """
+    if len(prices) < period + 1:
+        return None
+
+    window = prices[-(period + 1):]
+    net_change = abs(window[-1] - window[0])
+    sum_abs_changes = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
+
+    if sum_abs_changes == 0:
+        return 1.0  # No movement at all — treat as directional (no noise)
+
+    return net_change / sum_abs_changes
+
+
 def calculate_trend_alignment(ema20: Optional[float], ema50: Optional[float], ema100: Optional[float], side: str) -> float:
     """
     Calculate trend alignment score (0-1).

@@ -18,8 +18,9 @@ from ..config import DRY_RUN, TIME_EXIT_BARS, DRY_SIMPLE_EXITS, DRY_SIMPLE_SL_R,
 @dataclass
 class ScalperExitAction:
     """Action to take for a scalper position."""
-    action: str  # "update_sl", "exit", or None
+    action: str  # "update_sl", "update_tp", "update_both", "exit", or None
     new_stop: Optional[float] = None
+    new_tp: Optional[float] = None  # Profit-ratcheting TP
     exit_reason: Optional[str] = None
     exit_size_ratio: float = 1.0  # 1.0 = full exit
 
@@ -245,26 +246,48 @@ def evaluate_scalper_trailing(
                     exit_reason=None
                 )
     
-    # 4. Main Trailing (+0.6 ATR)
+    # 4. Main Trailing + Trailing TP (+0.6 ATR)
+    # Both SL and TP trail the price continuously. SL at 0.35 ATR, TP at variable distance.
     if profit_atr >= 0.6:
-        # Use trailing stop tied to current price: SL = current_price -/+ (0.35 * ATR)
+        # Determine TP trail distance based on profit level
+        if profit_atr >= 2.0:
+            tp_trail_atr = 0.12
+        elif profit_atr >= 1.5:
+            tp_trail_atr = 0.20
+        elif profit_atr >= 1.0:
+            tp_trail_atr = 0.35
+        else:
+            tp_trail_atr = 0.50
+
         if side == "long":
             new_stop = current_price * (1.0 - 0.35 * atr_pct)
-            if new_stop > current_stop:  # Only move stop up
+            new_tp = current_price * (1.0 - tp_trail_atr * atr_pct)
+            if new_tp <= entry_price:
+                new_tp = entry_price * 1.001
+            do_sl = new_stop > current_stop
+            do_tp = True  # Trailing TP is always tighter than original
+            if do_sl or do_tp:
                 return ScalperExitAction(
-                    action="update_sl",
-                    new_stop=new_stop,
+                    action="update_both",
+                    new_stop=new_stop if do_sl else None,
+                    new_tp=new_tp,
                     exit_reason=None
                 )
         else:  # short
             new_stop = current_price * (1.0 + 0.35 * atr_pct)
-            if new_stop < current_stop or current_stop == 0:  # Only move stop down
+            new_tp = current_price * (1.0 + tp_trail_atr * atr_pct)
+            if new_tp >= entry_price:
+                new_tp = entry_price * 0.999
+            do_sl = new_stop < current_stop
+            do_tp = True
+            if do_sl or do_tp:
                 return ScalperExitAction(
-                    action="update_sl",
-                    new_stop=new_stop,
+                    action="update_both",
+                    new_stop=new_stop if do_sl else None,
+                    new_tp=new_tp,
                     exit_reason=None
                 )
-    
+
     # 5. Check if stop-loss hit
     if side == "long" and current_price <= current_stop:
         return ScalperExitAction(

@@ -11,6 +11,7 @@ from .modules import (
     score_portfolio,
     score_time_of_day,
     score_symbol_rating,
+    score_order_flow,
 )
 from .config import SCORE_CAPS, SCORE_MIN, SCORE_MAX, SCORING_BASE_SCALE
 
@@ -42,6 +43,7 @@ def build_score_components(ctx: SignalContext) -> ScoreComponents:
         portfolio=score_portfolio(ctx),
         time_of_day=score_time_of_day(ctx),
         symbol_rating=score_symbol_rating(ctx),
+        order_flow=score_order_flow(ctx),
     )
 
 

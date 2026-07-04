@@ -35,6 +35,7 @@ class TradingSignal:
     timestamp: float = None
     signal_score: Optional[SignalScore] = None  # Full score breakdown (old scorer)
     final_score: float = 0.0  # 0-100 scale (Scoring v2 final score)
+    composite_score: float = 0.0  # [-1, 1] Moss-style continuous composite
     score_v2: Optional[float] = None  # Scoring v2 final score
     score_components_raw: Optional[Dict] = None  # Scoring v2 raw components
     score_components_capped: Optional[Dict] = None  # Scoring v2 capped components
@@ -300,15 +301,26 @@ class SignalGenerator:
             symbol, entry_price, symbol_stats, price_data, indicators, regime_config
         )
         if momentum_signal:
+            # logger.debug(f"Momentum signal generated: {momentum_signal.strength}")
             signals.append(momentum_signal)
-        
-        # 2. Mean reversion signal (RSI-based)
+        else:
+            # logger.debug(f"No momentum signal for {symbol}")
+            pass
+
+        # 2. Mean reversion signal (RSI-based — only fires with OHLCV indicators)
         mean_reversion_signal = self._generate_mean_reversion_signal(
             symbol, entry_price, symbol_stats, price_data, indicators
         )
         if mean_reversion_signal:
             signals.append(mean_reversion_signal)
-        
+
+        # 3. Reversal signal (24h-based — always available, no OHLCV needed)
+        reversal_signal = self._generate_reversal_signal(
+            symbol, entry_price, symbol_stats
+        )
+        if reversal_signal:
+            signals.append(reversal_signal)
+
         # PURE SCALPER MODE: Trend signals disabled - only scalper signals (momentum/mean_reversion)
         # Trend following signal DISABLED for pure scalper mode
         # trend_signal = self._generate_trend_signal(
@@ -527,6 +539,7 @@ class SignalGenerator:
         
         # Need significant momentum (regime-specific threshold)
         if abs(pct_change) < min_momentum_pct:
+            # logger.debug(f"Momentum too low: {pct_change} < {min_momentum_pct}")
             return None
         
         # Calculate strength with relaxed normalization for testing
@@ -540,7 +553,10 @@ class SignalGenerator:
         # TIGHTENED: Weight momentum more heavily (80% vs 20% volume)
         strength = (momentum_strength * 0.8) + (volume_factor * 0.2)
         
+        # logger.debug(f"Momentum strength: {strength} (mom={momentum_strength}, vol={volume_factor}, raw_vol={volume_24h})")
+
         if strength < min_signal_strength:
+            # logger.debug(f"Strength too low: {strength} < {min_signal_strength}")
             return None
         
         # Determine direction
@@ -551,20 +567,26 @@ class SignalGenerator:
         from .config import TAKER_FEE_RATE, SLIPPAGE_BPS
         total_fee_rate = (TAKER_FEE_RATE * 2) + (SLIPPAGE_BPS / 10000)  # Entry + Exit + Slippage
         
-        atr_pct = 0.012  # Assume 1.2% ATR (slightly higher for safety)
+        # Use real ATR from indicators if available, otherwise fallback to 1.2%
+        if indicators and indicators.get('atr_pct'):
+            raw_atr = indicators['atr_pct']  # percentage (e.g., 0.83 = 0.83%)
+            atr_pct = (raw_atr / 100.0) * 8  # Convert 1-min % to hourly decimal (×8 ≈ √60)
+        else:
+            atr_pct = 0.012  # Fallback: 1.2% hourly ATR
+
         stop_loss_pct = atr_pct * stop_loss_atr_mult
         take_profit_pct = atr_pct * take_profit_atr_mult
-        
-        # TIGHTENED: Reduce take-profit for faster scalping exits
-        # Cap take-profit at 2.0% for scalping (was 2.5% = 2.4% after fees)
-        # This prevents positions from waiting too long for ambitious targets
-        max_tp_pct = 0.020  # 2.0% maximum take-profit for scalping
-        take_profit_pct = min(take_profit_pct, max_tp_pct)
-        
-        # Ensure minimum R:R of 1.5:1 after costs
-        min_tp_pct = stop_loss_pct * 1.5 + total_fee_rate  # 1.5:1 R:R + fees
+
+        # Ensure minimum R:R of 1.5:1 after fees — TP must be at least 1.5× SL
+        min_tp_pct = stop_loss_pct * 1.5 + total_fee_rate
         take_profit_pct = max(take_profit_pct, min_tp_pct)
-        
+
+        # STOP JITTER: randomize ±STOP_JITTER_PCT to avoid predictable stop-hunt levels
+        from .config import STOP_JITTER_PCT
+        import random
+        jitter = 1.0 + random.uniform(-STOP_JITTER_PCT, STOP_JITTER_PCT)
+        stop_loss_pct *= jitter
+
         if side == "long":
             stop_loss = entry_price * (1 - stop_loss_pct)
             take_profit = entry_price * (1 + take_profit_pct)
@@ -608,7 +630,7 @@ class SignalGenerator:
         if rsi < 20:  # More extreme oversold (was 25) - only very oversold
             strength = (20 - rsi) / 20.0  # 0-1 based on oversold level (RSI 0-20)
             stop_loss_pct = 0.015  # 1.5% stop
-            take_profit_pct = 0.020  # 2.0% target (tightened for faster scalping exits)
+            take_profit_pct = 0.030  # 3.0% target (ensures proper R:R with 1.5-2.0% stops)
             
             # Ensure minimum R:R of 1.5:1 after costs
             from .config import TAKER_FEE_RATE, SLIPPAGE_BPS
@@ -616,7 +638,7 @@ class SignalGenerator:
             min_tp_pct = stop_loss_pct * 1.5 + total_fee_rate
             take_profit_pct = max(take_profit_pct, min_tp_pct)
             # Cap at 2.0% for scalping
-            take_profit_pct = min(take_profit_pct, 0.020)
+            take_profit_pct = max(take_profit_pct, stop_loss_pct * 1.5)  # Min 1.5:1 R:R
             
             return TradingSignal(
                 symbol=symbol,
@@ -633,7 +655,7 @@ class SignalGenerator:
         if rsi > 80:  # More extreme overbought (was 75) - only very overbought
             strength = (rsi - 80) / 20.0  # 0-1 based on overbought level (RSI 80-100)
             stop_loss_pct = 0.015  # 1.5% stop
-            take_profit_pct = 0.020  # 2.0% target (tightened for faster scalping exits)
+            take_profit_pct = 0.030  # 3.0% target (ensures proper R:R with 1.5-2.0% stops)
             
             # Ensure minimum R:R of 1.5:1 after costs
             from .config import TAKER_FEE_RATE, SLIPPAGE_BPS
@@ -641,7 +663,7 @@ class SignalGenerator:
             min_tp_pct = stop_loss_pct * 1.5 + total_fee_rate
             take_profit_pct = max(take_profit_pct, min_tp_pct)
             # Cap at 2.0% for scalping
-            take_profit_pct = min(take_profit_pct, 0.020)
+            take_profit_pct = max(take_profit_pct, stop_loss_pct * 1.5)  # Min 1.5:1 R:R
             
             return TradingSignal(
                 symbol=symbol,
@@ -656,6 +678,72 @@ class SignalGenerator:
         
         return None
     
+    def _generate_reversal_signal(
+        self,
+        symbol: str,
+        entry_price: float,
+        symbol_stats: Dict
+    ) -> Optional[TradingSignal]:
+        """Generate mean-reversion reversal signal from 24h price change.
+
+        Works in live/DRY mode without OHLCV indicators.
+        Uses 24h change as a simple overbought/oversold proxy:
+        - Up > 5% in 24h → overextended, potential pullback → SHORT
+        - Down > 5% in 24h → oversold, potential bounce → LONG
+        """
+        pct_change = symbol_stats.get('pct_change_24h', 0)
+        volume_24h = symbol_stats.get('vol_quote', 0)
+
+        # Need significant move for reversal signal
+        if abs(pct_change) < 3.0:
+            return None
+
+        # Volume check: need at least $5M 24h volume
+        if volume_24h < 5_000_000:
+            return None
+
+        # Overbought → short (up too much, due for pullback)
+        if pct_change > 3.0:
+            side = "short"
+            # Strength: linear 3%→10%, capped at 0.75
+            strength = min((pct_change - 3.0) / 7.0, 0.75)
+            # Wider stops for reversal (counter-trend trades need room)
+            stop_loss_pct = 0.025  # 2.5% stop
+            take_profit_pct = 0.030  # 3.0% target (tight — quick pullback)
+            reason = f"Overbought reversal ({pct_change:.1f}% up in 24h)"
+        # Oversold → long (down too much, due for bounce)
+        elif pct_change < -3.0:
+            side = "long"
+            strength = min(abs(pct_change + 5.0) / 10.0, 0.75)
+            stop_loss_pct = 0.025  # 2.5% stop
+            take_profit_pct = 0.030  # 3.0% target
+            reason = f"Oversold reversal ({pct_change:.1f}% down in 24h)"
+        else:
+            return None
+
+        # STOP JITTER: randomize to avoid predictable stop-hunt levels
+        import random
+        from .config import STOP_JITTER_PCT
+        stop_loss_pct *= 1.0 + random.uniform(-STOP_JITTER_PCT, STOP_JITTER_PCT)
+
+        if side == "long":
+            stop_loss = entry_price * (1 - stop_loss_pct)
+            take_profit = entry_price * (1 + take_profit_pct)
+        else:
+            stop_loss = entry_price * (1 + stop_loss_pct)
+            take_profit = entry_price * (1 - take_profit_pct)
+
+        return TradingSignal(
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            strength=strength,
+            signal_type="mean_reversion",
+            reason=reason
+        )
+
     def _generate_trend_signal(
         self,
         symbol: str,

@@ -24,6 +24,7 @@ class ScoreComponents:
     portfolio: float = 0.0
     time_of_day: float = 0.0
     symbol_rating: float = 0.0
+    order_flow: float = 0.0
 
     def capped(self, caps: Dict[str, tuple]) -> "ScoreComponents":
         """
@@ -58,6 +59,7 @@ class ScoreComponents:
             + self.portfolio
             + self.time_of_day
             + self.symbol_rating
+            + self.order_flow
         )
 
     def to_dict(self) -> Dict[str, float]:

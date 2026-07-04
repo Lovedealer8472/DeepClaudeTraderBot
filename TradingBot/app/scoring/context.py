@@ -45,5 +45,15 @@ class SignalContext:
     corr_to_btc_24h: float
     symbol_rating: float         # from historical perf [-10,+10] pre-clamped
 
+    # Order flow / OI
+    orderbook_imbalance: float = 0.0  # bid_vol/(bid_vol+ask_vol) — 0.5=neutral
+    oi_change_pct: float = 0.0  # Open interest 24h change % — positive=conviction
+    funding_rate: float = 0.0  # Current funding rate (per period) — extreme=crowded
+
+    # Taker buy/sell & positioning (from research: top predictors for reversals)
+    taker_buy_ratio: float = 0.5  # taker buy vol / total taker vol — >0.5=buys dominate
+    long_short_ratio: float = 1.0  # global long/short account ratio — >2.0=overcrowded longs
+    absorption_score: float = 0.0  # bid depth ÷ price drop — high=someone absorbing, reversal signal
+
     extra: Optional[Dict[str, Any]] = None  # extension hook
 

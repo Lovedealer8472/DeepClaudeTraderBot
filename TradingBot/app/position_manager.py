@@ -190,15 +190,31 @@ class PositionManager:
         if base_size <= 0:
             return 0.0, 0.0, "size_too_small"
         
-        # Apply leverage (use provided leverage or fall back to LEVERAGE_BASE)
+        # Leverage affects margin, NOT contract count. PnL = contracts × price_diff regardless of leverage.
+        # base_size is already the correct contract count for the risk budget.
+        position_size = base_size
+        # Track what leverage was used (informational, doesn't affect sizing)
         if leverage is None:
             leverage = LEVERAGE_BASE
-        actual_leverage = leverage  # Store for later use
-        
-        # CRITICAL: Store LEVERAGED SIZE in position (for consistency with bot.py)
-        # This is the contract size that exchange sees (base_size * leverage)
-        position_size = base_size * leverage
-        
+        actual_leverage = leverage
+
+        # Volatility-Targeted Sizing: scale down when market is volatile
+        # Reference: pupedator/binance-futures-ai-bot (Hurst, Ooi & Pedersen, 2012)
+        from .config import VOL_TARGET_ENABLED, VOL_TARGET_NORMAL_ATR, VOL_TARGET_ELEVATED_ATR
+        from .config import VOL_TARGET_SIZE_MULT_ELEVATED, VOL_TARGET_SIZE_MULT_HIGH
+        if VOL_TARGET_ENABLED and open_positions is not None:
+            # Estimate current ATR from existing positions or use default
+            atr_pct = 1.0  # Default: assume 1% ATR
+            for pos in open_positions.values():
+                if isinstance(pos, dict) and pos.get('atr_pct'):
+                    atr_pct = max(atr_pct, pos['atr_pct'])
+                    break
+            # Scale: normal vol = full size, elevated = 75%, high = 50%
+            if atr_pct > VOL_TARGET_ELEVATED_ATR:
+                position_size *= VOL_TARGET_SIZE_MULT_HIGH
+            elif atr_pct > VOL_TARGET_NORMAL_ATR:
+                position_size *= VOL_TARGET_SIZE_MULT_ELEVATED
+
         # Cap position size by capital limits
         max_capital = equity * MAX_CAPITAL_PER_POS
         max_position_by_capital = max_capital / entry_price

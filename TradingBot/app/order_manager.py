@@ -40,12 +40,14 @@ class OrderManager:
         entry_price: float,
         delay_ms: Optional[int] = None,
         use_limit: bool = False,
-        leverage: Optional[int] = None
+        leverage: Optional[int] = None,
+        stop_loss_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None
     ) -> OrderResult:
         """
         Enter a position with smart execution.
-        OPTIMIZED: Parallel operations and faster execution paths.
-        
+        SL/TP attached atomically via Binance OCO — exchange handles exits.
+
         Args:
             symbol: Trading symbol
             side: 'long' or 'short'
@@ -54,7 +56,9 @@ class OrderManager:
             delay_ms: Entry delay in milliseconds
             use_limit: Use limit order instead of market
             leverage: Leverage to use
-        
+            stop_loss_price: SL price (attached atomically by Binance)
+            take_profit_price: TP price (attached atomically by Binance)
+
         Returns:
             OrderResult
         """
@@ -88,7 +92,6 @@ class OrderManager:
         
         try:
             if DRY_RUN:
-                # Simulate order execution
                 result = OrderResult(
                     success=True,
                     order_id=f"DRY_{int(time.time() * 1000)}",
@@ -97,18 +100,26 @@ class OrderManager:
                     latency_ms=(time.time() - start_time) * 1000
                 )
             else:
-                # OPTIMIZATION: Use faster execution path for market orders
+                order_params = {}
+                if stop_loss_price:
+                    order_params['stopLossPrice'] = stop_loss_price
+                if take_profit_price:
+                    order_params['takeProfitPrice'] = take_profit_price
+
                 if use_limit:
                     result = await self._place_limit_order(
-                        symbol, side, size, entry_price
+                        symbol, side, size, entry_price, order_params
                     )
                 else:
-                    # OPTIMIZATION: Market orders are faster - use optimized path
                     result = await self._place_market_order_fast(
-                        symbol, side, size
+                        symbol, side, size, order_params
                     )
-                
                 result.latency_ms = (time.time() - start_time) * 1000
+
+                # -2021: SL/TP rejected as too close to market. Do NOT enter naked — skip.
+                # Naked entries get closed at a loss when monitor can't protect in time.
+                if not result.success and order_params and '2021' in str(result.error or ''):
+                    pass  # Return the failure — bot will cooldown this symbol and move on
             
             # Record order (non-blocking)
             self.order_history.append({
@@ -191,7 +202,8 @@ class OrderManager:
         self,
         symbol: str,
         side: str,
-        size: float
+        size: float,
+        params: dict = None
     ) -> OrderResult:
         """
         OPTIMIZED: Fast market order placement with minimal overhead.
@@ -210,7 +222,7 @@ class OrderManager:
                 order_side,
                 size,
                 None,  # price not needed for market orders
-                params={}  # Let exchange wrapper handle Binance-specific params
+                params=params if params else {}  # SL/TP attached atomically
             )
             
             # OPTIMIZATION: Get fill price immediately from order response
@@ -247,7 +259,8 @@ class OrderManager:
         self,
         symbol: str,
         side: str,
-        size: float
+        size: float,
+        params: dict = None
     ) -> OrderResult:
         """Place market order."""
         try:
@@ -261,7 +274,7 @@ class OrderManager:
                 order_side,
                 size,
                 None,  # price not needed for market orders
-                params={}  # Let exchange wrapper handle Binance-specific params
+                params=params if params else {}  # SL/TP attached atomically
             )
             
             # Get filled price
@@ -290,7 +303,8 @@ class OrderManager:
         symbol: str,
         side: str,
         size: float,
-        price: float
+        price: float,
+        params: dict = None
     ) -> OrderResult:
         """Place limit order."""
         try:
@@ -304,7 +318,7 @@ class OrderManager:
                 order_side,
                 size,
                 price,
-                params={}  # Let exchange wrapper handle Binance-specific params
+                params=params if params else {}  # SL/TP attached atomically
             )
             
             # Wait for fill (with timeout)
@@ -381,4 +395,106 @@ class OrderManager:
         
         # Default: use limit for strong signals, market for others
         return signal_strength > 0.8
+
+    # ═══════════════════════════════════════════════════════
+    # SL/TP ORDER MANAGEMENT (Binance Futures — no OCO)
+    # ═══════════════════════════════════════════════════════
+
+    async def place_sl_order(self, symbol: str, side: str, size: float,
+                              stop_price: float) -> Optional[str]:
+        """Place STOP_MARKET order for stop-loss. Returns order_id, 'EXISTS', or None."""
+        from .logger import get_logger
+        from .error_catalog import classify, ErrorCategory
+        try:
+            order_side = "sell" if side == "long" else "buy"
+            order = await self.exchange.create_order(
+                symbol, "STOP_MARKET", order_side, size, None,
+                {"stopPrice": stop_price, "closePosition": True}
+            )
+            oid = order.get("id")
+            get_logger("OrderManager").info(f"[SL_PLACED] {symbol} SL @ {stop_price:.6f} id={oid}")
+            return oid
+        except Exception as e:
+            err = str(e)
+            cat, strategy, desc = classify(err)
+            if cat == ErrorCategory.ALREADY_PROTECTED:
+                get_logger("OrderManager").info(f"[SL_EXISTS] {symbol} — closePosition order active (expected)")
+                return "EXISTS"
+            if cat == ErrorCategory.NO_POSITION:
+                get_logger("OrderManager").warning(f"[SL_RETRY] {symbol} position not visible yet — retrying")
+                return None  # Caller should retry
+            get_logger("OrderManager").error(f"[SL_FAIL] {symbol}: {cat.value} — {err[:100]}")
+            return None
+
+    async def place_tp_order(self, symbol: str, side: str, size: float,
+                              take_profit_price: float) -> Optional[str]:
+        """Place TAKE_PROFIT_MARKET order. Returns order_id, 'EXISTS', or None."""
+        from .logger import get_logger
+        from .error_catalog import classify, ErrorCategory
+        try:
+            order_side = "sell" if side == "long" else "buy"
+            order = await self.exchange.create_order(
+                symbol, "TAKE_PROFIT_MARKET", order_side, size, None,
+                {"stopPrice": take_profit_price, "closePosition": True}
+            )
+            oid = order.get("id")
+            get_logger("OrderManager").info(f"[TP_PLACED] {symbol} TP @ {take_profit_price:.6f} id={oid}")
+            return oid
+        except Exception as e:
+            err = str(e)
+            cat, strategy, desc = classify(err)
+            if cat == ErrorCategory.ALREADY_PROTECTED:
+                get_logger("OrderManager").info(f"[TP_EXISTS] {symbol} — closePosition order active (expected)")
+                return "EXISTS"
+            if cat == ErrorCategory.NO_POSITION:
+                get_logger("OrderManager").warning(f"[TP_RETRY] {symbol} position not visible yet — retrying")
+                return None
+            get_logger("OrderManager").error(f"[TP_FAIL] {symbol}: {cat.value} — {err[:100]}")
+            return None
+
+    async def cancel_all_orders(self, symbol: str) -> bool:
+        """Cancel ALL open orders for a symbol. Returns True if successful."""
+        try:
+            await self.exchange.cancel_all_orders(symbol)
+            return True
+        except Exception:
+            return False
+
+    async def close_position_immediately(self, symbol: str, side: str,
+                                           size: float) -> bool:
+        """Emergency close: market order to exit a naked position. Returns True if filled."""
+        from .logger import get_logger
+        try:
+            order = await self.exchange.create_order(
+                symbol, "market", side, size, None,
+                {"reduceOnly": True}
+            )
+            oid = order.get("id", "?")
+            get_logger("OrderManager").warning(
+                f"[EMERGENCY_CLOSE] {symbol} {side} {size} id={oid}")
+            return True
+        except Exception as e:
+            get_logger("OrderManager").error(f"[EMERGENCY_CLOSE_FAIL] {symbol}: {e}")
+            return False
+
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """Cancel a single order. Returns True if successful."""
+        try:
+            await self.exchange.cancel_order(order_id, symbol)
+            return True
+        except Exception:
+            return False  # Order already filled or doesn't exist
+
+    async def check_order_filled(self, symbol: str, order_id: str) -> bool:
+        """Check if an order has been filled. Returns False if uncertain."""
+        from .logger import get_logger
+        try:
+            order = await self.exchange.fetch_order(order_id, symbol)
+            filled = order.get("status") == "closed" and float(order.get("filled", 0)) > 0
+            if filled:
+                get_logger("OrderManager").info(f"[ORDER_FILLED] {symbol} order={order_id}")
+            return filled
+        except Exception:
+            # Order not found (-2013) or fetch error — do NOT assume filled
+            return False
 

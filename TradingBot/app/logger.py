@@ -101,6 +101,10 @@ class UILogHandler(logging.Handler):
         r'STARTUP|SHUTDOWN',
         r'FATAL|CRITICAL',
         r'ERROR.*Exit failed',  # Exit failures (important)
+        r'SLTP_FILL|SLTP_MONITOR|SLTP_REPLACE',  # SL/TP exit detection
+        r'\[ENTRY\]|\[EXIT\]',  # Entry/exit events
+        r'TRAIL_SL_UPDATE|TRAILING STOP HIT',  # Trailing stop updates
+        r'SL_PLACED|TP_PLACED|DEFERRED|ORPHAN|NAKED',  # Order management
     ]
     
     # Patterns that should be EXCLUDED from LOG panel (even if INFO/WARNING)

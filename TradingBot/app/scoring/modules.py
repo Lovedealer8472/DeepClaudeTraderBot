@@ -159,3 +159,75 @@ def score_symbol_rating(ctx: SignalContext) -> float:
     # Scale down the rating to keep it as a small adjustment
     return ctx.symbol_rating * 0.3  # Scale to -3 to +3 range
 
+
+def score_order_flow(ctx: SignalContext) -> float:
+    """Orderbook imbalance, OI, funding, taker flow, positioning, absorption. Range -5 to +5."""
+    s = 0.0
+
+    # Orderbook imbalance: bid-heavy = buying pressure, ask-heavy = selling pressure
+    imb = ctx.orderbook_imbalance
+    if ctx.side == "long":
+        if imb > 0.65:      s += 2.0   # Strong bid support
+        elif imb > 0.55:    s += 1.0   # Mild bid bias
+        elif imb < 0.35:    s -= 2.0   # Ask-heavy — bad for longs
+        elif imb < 0.45:    s -= 1.0   # Mild ask bias
+    else:  # short
+        if imb < 0.35:      s += 2.0   # Strong ask pressure
+        elif imb < 0.45:    s += 1.0   # Mild ask bias
+        elif imb > 0.65:    s -= 2.0   # Bid-heavy — bad for shorts
+        elif imb > 0.55:    s -= 1.0   # Mild bid bias
+
+    # Open Interest change: OI rising with price = trend conviction
+    oi = ctx.oi_change_pct
+    if oi != 0:
+        if ctx.side == "long":
+            if oi > 2.0:    s += 1.5
+            elif oi > 0.5:  s += 0.5
+            elif oi < -2.0: s -= 1.0
+        else:  # short
+            if oi > 2.0:    s += 1.5
+            elif oi > 0.5:  s += 0.5
+            elif oi < -2.0: s -= 1.0
+
+    # Funding rate: extreme rates = crowded trade → contrarian signal
+    fr = ctx.funding_rate
+    if abs(fr) > 0.0001:
+        if ctx.side == "long" and fr > 0.0005:       s -= 1.5
+        elif ctx.side == "long" and fr > 0.0002:     s -= 0.5
+        elif ctx.side == "short" and fr < -0.0005:   s -= 1.5
+        elif ctx.side == "short" and fr < -0.0002:   s -= 0.5
+        elif ctx.side == "long" and fr < -0.0002:    s += 0.5
+        elif ctx.side == "short" and fr > 0.0002:    s += 0.5
+
+    # Taker buy/sell ratio: who's crossing the spread?
+    # >0.55 = buyers aggressive, <0.45 = sellers aggressive
+    taker = ctx.taker_buy_ratio
+    if taker > 0.55:
+        if ctx.side == "long":   s += 1.0  # Buyers dominating — good for longs
+        else:                    s -= 0.5  # Buyers dominating — bad for shorts
+    elif taker < 0.45:
+        if ctx.side == "short":  s += 1.0  # Sellers dominating — good for shorts
+        else:                    s -= 0.5  # Sellers dominating — bad for longs
+
+    # Long/short ratio: extreme positioning = fragile, reversal-prone
+    # >2.5 = overcrowded longs, <0.4 = overcrowded shorts
+    ls = ctx.long_short_ratio
+    if ls > 2.5:
+        if ctx.side == "long":   s -= 1.0  # Everyone's long — reversal risk
+        else:                    s += 1.5  # Overcrowded longs = good short entry
+    elif ls < 0.4:
+        if ctx.side == "short":  s -= 1.0  # Everyone's short — reversal risk
+        else:                    s += 1.5  # Overcrowded shorts = good long entry
+
+    # Absorption score: bid depth ÷ price drop. Someone absorbing = reversal ahead.
+    # Range 0-1, >0.3 = meaningful absorption.
+    absorb = ctx.absorption_score
+    if absorb > 0.5:
+        if ctx.side == "long":   s += 2.0  # Bids absorbing sells = bullish reversal
+        else:                    s -= 1.0  # Bids absorbing sells = bad for shorts
+    elif absorb > 0.3:
+        if ctx.side == "long":   s += 1.0
+        else:                    s -= 0.5
+
+    return max(-5.0, min(5.0, s))
+
