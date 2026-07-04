@@ -1121,7 +1121,7 @@ class ScalperBot:
     
     async def scan_and_enter_signals(self):
         """Scan for trading signals and enter positions."""
-        global asyncio  # Fix: Python 3.14 closure scoping — inner process_symbol ref forces local binding
+        global asyncio  # Fix: Python 3.14 closure scoping — consider passing loop explicitly — inner process_symbol ref forces local binding
         # DEBUG: Log strategy cycle entry point
         self.logger.info("[DEBUG] Strategy cycle triggered - scan_and_enter_signals() called")
         # DEBUG: Increment scan counter and log every 100 cycles

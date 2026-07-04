@@ -94,7 +94,7 @@ TOTAL_RISK_BUDGET = env("TOTAL_RISK_BUDGET", "2.0", float) / 100.0  # Total risk
 # NOTE: Effective max positions are now dynamic: floor(MAX_ACCOUNT_RISK_PCT / RISK_PER_TRADE_PCT),
 # but never exceed MAX_CONCURRENT_POS_HARD. The old MAX_OPEN_POSITIONS is kept for backward compatibility.
 MAX_OPEN_POSITIONS = env("MAX_OPEN_POSITIONS", "5", int)  # Legacy: kept for backward compatibility, not used as hard gate
-MAX_CONCURRENT_POS = MAX_OPEN_POSITIONS  # Alias for backward compatibility
+MAX_CONCURRENT_POS = MAX_OPEN_POSITIONS  # Alias — use MAX_OPEN_POSITIONS as canonical name  # Alias for backward compatibility
 MAX_CONCURRENT_POS_MIN = env("MAX_CONCURRENT_POS_MIN","1", int)  # Minimum positions (scalper: 1-3)
 MAX_CONCURRENT_POS_MAX = env("MAX_CONCURRENT_POS_MAX","5", int)  # Legacy: kept for backward compatibility, not used as hard gate
 

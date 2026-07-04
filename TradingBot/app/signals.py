@@ -357,49 +357,50 @@ class SignalGenerator:
         best_signal.signal_score = signal_score
         base_final_score = signal_score.final_score
         
-        # SCORING V2: Build context and compute final score with multi-dimensional adjustments
-        try:
-            # Get advanced_features if available (needed for Scoring v2)
-            advanced_features = None
-            if hasattr(self, '_advanced_features_cache'):
-                advanced_features = self._advanced_features_cache.get(symbol)
+        # SCORING V2: Only run if SignalScorer didn't already do it (avoid double compute)
+        from .config import USE_NEW_SCORING_SYSTEM as _USE_NEW_SCORING
+        if not _USE_NEW_SCORING:
+            try:
+                # Get advanced_features if available (needed for Scoring v2)
+                advanced_features = None
+                if hasattr(self, '_advanced_features_cache'):
+                    advanced_features = self._advanced_features_cache.get(symbol)
             
-            # Build SignalContext for Scoring v2
-            ctx = build_signal_context(
-                symbol=symbol,
-                side=best_signal.side,
-                base_score=base_final_score,  # Use old scorer's final_score as base
-                symbol_stats=symbol_stats,
-                orderbook=orderbook,
-                indicators=indicators,
-                advanced_features=advanced_features,
-                position_manager_state=position_manager_state,
-                bot_positions=bot_positions  # SCORING V2: For portfolio scoring
-            )
+                # Build SignalContext for Scoring v2
+                ctx = build_signal_context(
+                    symbol=symbol,
+                    side=best_signal.side,
+                    base_score=base_final_score,  # Use old scorer's final_score as base
+                    symbol_stats=symbol_stats,
+                    orderbook=orderbook,
+                    indicators=indicators,
+                    advanced_features=advanced_features,
+                    position_manager_state=position_manager_state,
+                    bot_positions=bot_positions  # SCORING V2: For portfolio scoring
+                )
             
-            # Compute Scoring v2 final score
-            final_score_v2, raw_components, capped_components = compute_final_score(ctx)
+                # Compute Scoring v2 final score
+                final_score_v2, raw_components, capped_components = compute_final_score(ctx)
             
-            # Store Scoring v2 results in signal
-            best_signal.final_score = final_score_v2  # Use Scoring v2 final score
-            best_signal.strength = final_score_v2 / 100.0  # Backward compatibility
-            best_signal.score_v2 = final_score_v2
-            best_signal.score_components_raw = raw_components.to_dict()
-            best_signal.score_components_capped = capped_components.to_dict()
+                # Store Scoring v2 results in signal
+                best_signal.final_score = final_score_v2  # Use Scoring v2 final score
+                best_signal.strength = final_score_v2 / 100.0  # Backward compatibility
+                best_signal.score_v2 = final_score_v2
+                best_signal.score_components_raw = raw_components.to_dict()
+                best_signal.score_components_capped = capped_components.to_dict()
             
         except Exception as e:
-            # Fallback to old score if Scoring v2 fails
-            import logging
-            logger = logging.getLogger("SignalGenerator")
-            logger.debug(f"Scoring v2 failed for {symbol}, using base score: {e}")
-            best_signal.final_score = base_final_score
-            best_signal.strength = base_final_score / 100.0
-            best_signal.score_v2 = None
+                # Fallback to old score if Scoring v2 fails
+                import logging
+                logger = logging.getLogger("SignalGenerator")
+                logger.debug(f"Scoring v2 failed for {symbol}, using base score: {e}")
+                best_signal.final_score = base_final_score
+                best_signal.strength = base_final_score / 100.0
+                best_signal.score_v2 = None
             best_signal.score_components_raw = None
             best_signal.score_components_capped = None
-        
-        # Calculate dynamic thresholds (always called, but only used if DYNAMIC_THRESHOLDS_ENABLED is True)
-        recent_trades_list = recent_trades if recent_trades else []
+                        # Calculate dynamic thresholds (always called, but only used if DYNAMIC_THRESHOLDS_ENABLED is True)
+            recent_trades_list = recent_trades if recent_trades else []
         btc_trend_value = btc_trend if btc_trend is not None else 0.0
         dynamic_score, dynamic_strength, dynamic_percentile = self._calculate_dynamic_thresholds(
             recent_trades_list, volatility_regime, btc_trend_value
