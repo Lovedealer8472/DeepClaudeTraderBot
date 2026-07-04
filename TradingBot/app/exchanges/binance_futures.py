@@ -374,7 +374,10 @@ class BinanceFuturesExchange(ExchangeBase):
                 params = {}
             return await self.exchange.fetch_order_book(symbol, limit=limit, params=params)
         except Exception as e:
-            self.logger.warning(f"Error fetching orderbook for {symbol}: {e}")
+            err_str = str(e)
+            # Skip logging for expired/unlisted symbols (expected — quarterly futures expire)
+            if 'does not have market symbol' not in err_str:
+                self.logger.warning(f"Error fetching orderbook for {symbol}: {e}")
             return None
     
     async def fetch_balance(self, params: Optional[Dict] = None) -> Dict[str, Any]:
@@ -399,22 +402,83 @@ class BinanceFuturesExchange(ExchangeBase):
             # Ensure params is always a dict (CCXT requires it)
             if params is None:
                 params = {}
+            # Denormalize symbols — ccxt needs BTWUSDT not BTW/USDT
+            if symbols:
+                symbols = [self.denormalize_symbol(s) for s in symbols]
             # Binance futures uses defaultType="future" in options
             positions = await self.exchange.fetch_positions(symbols, params=params)
+            # Normalize output symbols to internal format (ccxt returns "BASE/QUOTE:SETTLE")
+            for p in positions:
+                if 'symbol' in p:
+                    p['symbol'] = self.normalize_symbol(p['symbol'])
             # Filter for open positions only (contracts != 0)
             return [p for p in positions if p.get("contracts", 0) != 0]
         except Exception as e:
             self.logger.warning(f"Error fetching positions: {e}")
             return []
-    
+
+    async def fetch_open_interest(self, symbol: str) -> Dict[str, Any]:
+        """Fetch current open interest for a symbol."""
+        if not self.exchange:
+            return {}
+        try:
+            exchange_symbol = self.denormalize_symbol(symbol)
+            return await self.exchange.fetch_open_interest(exchange_symbol) or {}
+        except Exception:
+            return {}
+
+    async def fetch_taker_buy_ratio(self, symbol: str) -> float:
+        """Fetch taker buy/sell volume ratio. Returns 0.5 if unavailable (neutral)."""
+        if not self.exchange:
+            return 0.5
+        try:
+            exchange_symbol = self.denormalize_symbol(symbol)
+            # Binance REST: GET /futures/data/takerlongshortRatio
+            data = await self.exchange.fapiDataGetTakerlongshortRatio({
+                'symbol': exchange_symbol.replace('/', '').replace(':USDT', ''),
+                'period': '5m', 'limit': 1})
+            if data and len(data) > 0:
+                buy_vol = float(data[0].get('buyVol', 0))
+                sell_vol = float(data[0].get('sellVol', 0))
+                total = buy_vol + sell_vol
+                return buy_vol / total if total > 0 else 0.5
+            return 0.5
+        except Exception:
+            return 0.5
+
+    async def fetch_long_short_ratio(self, symbol: str) -> float:
+        """Fetch global long/short account ratio. Returns 1.0 if unavailable (neutral)."""
+        if not self.exchange:
+            return 1.0
+        try:
+            exchange_symbol = self.denormalize_symbol(symbol)
+            data = await self.exchange.fapiDataGetGlobalLongShortAccountRatio({
+                'symbol': exchange_symbol.replace('/', '').replace(':USDT', ''),
+                'period': '5m', 'limit': 1})
+            if data and len(data) > 0:
+                return float(data[0].get('longShortRatio', 1.0))
+            return 1.0
+        except Exception:
+            return 1.0
+
     async def create_order(self, symbol: str, order_type: str, side: str,
                           amount: float, price: Optional[float] = None,
                           params: Optional[Dict] = None) -> Dict[str, Any]:
-        """Create a futures order."""
+        """Create a futures order.
+
+        DRY_RUN note: Entry orders (MARKET, LIMIT) are faked to avoid real trades.
+        Protection orders (STOP_MARKET, TAKE_PROFIT_MARKET) are ALWAYS real —
+        positions on exchange MUST be protected regardless of DRY_RUN mode.
+        """
         # Denormalize symbol for exchange API (Binance uses "BTC/USDT" format, same as normalized)
         exchange_symbol = self.denormalize_symbol(symbol)
-        
-        if self.dry_run:
+
+        # Only fake ENTRY orders in DRY_RUN — protection orders MUST be real.
+        # closePosition SL/TP orders are invisible to fetch_open_orders on Binance,
+        # so the -4130 test is the only verification method.
+        _PROTECTION_TYPES = frozenset({"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "STOP_LIMIT",
+                                        "TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "TRAILING_STOP_MARKET"})
+        if self.dry_run and order_type.upper() not in _PROTECTION_TYPES:
             import time
             return {
                 "id": f"DRY_{int(time.time() * 1000)}",
@@ -446,7 +510,11 @@ class BinanceFuturesExchange(ExchangeBase):
                 exchange_symbol, order_type, side, amount, price, params
             )
         except Exception as e:
-            self.logger.error(f"Error creating order {exchange_symbol} {side} {amount}: {e}")
+            err_str = str(e)
+            if '4130' in err_str:
+                self.logger.info(f"[ORDER_EXISTS] {exchange_symbol} closePosition order already active (expected)")
+            else:
+                self.logger.error(f"Error creating order {exchange_symbol} {side} {amount}: {e}")
             raise
     
     async def set_leverage(self, leverage: int, symbol: str, params: Optional[Dict] = None):

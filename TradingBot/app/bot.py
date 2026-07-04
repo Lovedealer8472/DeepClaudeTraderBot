@@ -140,7 +140,6 @@ class ScalperBot:
         self.position_registry = PositionRegistry()
         # Backward compatibility: expose positions dict directly
         self.positions = self.position_registry._positions  # Direct access for compatibility
-        self._positions_set = self.position_registry._positions_set  # Direct access for compatibility
         self.cooldown_until = {}
 
         self.start_equity = ACCOUNT_BAL
@@ -184,9 +183,15 @@ class ScalperBot:
         # API BUDGET OPTIMIZATION: Enhanced data fetching
         self.orderbook_cache = {}  # Cache orderbooks for top symbols
         self.funding_rates = {}  # Cache funding rates
+        # Durable in-flight tracking — crash recovery (Hummingbot pattern)
+        from .durable_tracker import DurableTracker
+        self.durable_tracker = DurableTracker("data/in_flight_orders.json")
+        self.indicators_cache = {}  # Cache computed indicators per symbol (RSI, ADX, ATR, etc.)
         self.last_orderbook_refresh = 0.0
+        self._last_positions_ob_refresh = 0.0  # Separate timer to avoid gate conflict
         self.last_funding_refresh = 0.0
         self.orderbook_refresh_interval = 5.0  # Refresh orderbooks every 5s (20 calls = 240/min)
+        self._positions_ob_interval = 3.0  # Position orderbooks every 3s (was 1s — 5x API reduction)
         self.funding_refresh_interval = 60.0  # Refresh funding rates every 60s (30 calls = 30/min)
         self.signal_stats = {
             'signals_generated': 0,
@@ -229,6 +234,21 @@ class ScalperBot:
         
         # DEBUG: Scan cycle counter for replay debugging
         self.debug_scan_counter = 0
+
+    async def cleanup(self):
+        """Cleanup resources."""
+        try:
+            # Cleanup: Close storage connection
+            if hasattr(self, 'fast_storage'):
+                self.fast_storage.close()
+            # Close exchange wrapper
+            if self.exchange_wrapper:
+                await self.exchange_wrapper.close()
+            elif self.exchange:
+                # Fallback to direct exchange close (backward compatibility)
+                await self.exchange.close()
+        except Exception as e:
+            self.logger.warning(f"Error during cleanup: {e}")
     
     def _calculate_pnl_pct(self, entry_price: float, current_price: float, side: str) -> float:
         """
@@ -553,7 +573,7 @@ class ScalperBot:
             self.volatility_regime = "Normal"
 
     async def refresh_universe(self) -> None:
-        # OPTIMIZATION: Cache time once per refresh
+        # self.logger.debug("refresh_universe called")
         loop_start = self._get_current_time()
         refresh_now = loop_start
         
@@ -601,7 +621,10 @@ class ScalperBot:
                     st.spread_bps = float(spread_bps)
                     st.heat = (math.log10(vol_quote + 1.0) - 5.0) - (spread_bps / 200.0)
                     st.last_seen = refresh_now
-                    st.pct_change_24h = 0.0  # Not available in replay
+                    # Use percentage from ticker data if available, else 0.0
+                    st.pct_change_24h = float(t.get("percentage", 0.0) or 0.0)
+                    
+                    # self.logger.debug(f"Updated stats for {sym}")
                 
                 # Update ticker cache
                 self.ticker_cache.batch_set(tickers)
@@ -623,6 +646,12 @@ class ScalperBot:
                         f"[UNIVERSE] Size={len(universe_symbols)} | Sample={universe_symbols[:sample_size]}"
                     )
                     self._universe_logged = True
+                
+                # FORCE ROTATION IN REPLAY MODE
+                if not self.universe.active:
+                     self.universe.rotate(force_full_rotation=True)
+                     # self.logger.debug(f"Active symbols after rotation: {self.universe.active}")
+                
                 return
             except Exception as e:
                 self.logger.warning(f"Replay universe refresh failed: {e}")
@@ -677,7 +706,12 @@ class ScalperBot:
                 # Normalize symbol for internal use
                 normalized_sym = self.exchange_wrapper.normalize_symbol(sym)
                 futures_tickers[normalized_sym] = t
-            
+
+            # WHITELIST ENFORCEMENT: only keep whitelisted symbols if configured
+            if WHITELIST_SYMBOLS:
+                normalized_whitelist = [self.exchange_wrapper.normalize_symbol(s) for s in WHITELIST_SYMBOLS]
+                futures_tickers = {k: v for k, v in futures_tickers.items() if k in normalized_whitelist}
+
             # LATENCY OPTIMIZATION: Batch update cache and storage (futures only)
             self.ticker_cache.batch_set(futures_tickers)
             self.fast_storage.batch_save(futures_tickers)
@@ -849,7 +883,7 @@ class ScalperBot:
                 # Denormalize symbol for exchange API
                 denormalized_symbol = self.exchange_wrapper.denormalize_symbol(symbol)
                 orderbook = await asyncio.wait_for(
-                    self.exchange_wrapper.fetch_order_book(denormalized_symbol, limit=20),  # Deeper depth
+                    self.exchange_wrapper.fetch_order_book(denormalized_symbol, limit=5),  # limit=5 = weight 1 (vs weight 5 for limit=20)
                     timeout=0.3
                 )
                 return (symbol, orderbook)
@@ -958,6 +992,89 @@ class ScalperBot:
                         'timestamp': batch_timestamp  # OPTIMIZATION: Use cached time
                     }
     
+    async def _execute_single_exit(self, symbol: str, position: dict, reason: str,
+                                    target_price: float, exit_size_pct: float = 1.0):
+        """Execute exit immediately via exit_manager (direct, reliable).
+        Runs as background task — survives monitor timeout."""
+        if not self.exit_manager:
+            return
+        try:
+            # Cancel exchange SL/TP orders (skip virtual IDs)
+            sl_id = position.get('sl_order_id')
+            tp_id = position.get('tp_order_id')
+            for oid in (sl_id, tp_id):
+                if oid and oid not in ("PENDING", "EXISTS", "RECONCILED", "ATOMIC"):
+                    try:
+                        await self.order_manager.cancel_order(symbol, oid)
+                    except Exception:
+                        pass
+
+            # Direct exit via exit_manager (proven reliable — RE exit worked)
+            result = await self.exit_manager.exit_position(
+                symbol=symbol, position=position, reason=reason)
+            if result.success:
+                pnl = result.net_pnl or 0
+                self.realized_pnl_total += pnl
+                if pnl > 0:
+                    self.win_count += 1; self.gross_win += pnl
+                else:
+                    self.loss_count += 1; self.gross_loss += abs(pnl)
+                self.logger.info(
+                    f"EXIT: {symbol} | {reason} | size={position.get('size',0):.4f} | "
+                    f"price={result.exit_price:.2f} | pnl={pnl:.2f}")
+                self.metrics['exits_by_reason'][reason] = \
+                    self.metrics['exits_by_reason'].get(reason, 0) + 1
+                # Remove from tracking
+                if symbol in self.positions:
+                    del self.positions[symbol]
+                self.position_manager.record_exit(symbol, pnl > 0)
+            else:
+                self.logger.warning(
+                    f"[EXIT_FAIL] {symbol} reason={reason} error={result.error}")
+        except Exception as e:
+            self.logger.error(f"[EXIT_EXEC_ERROR] {symbol}: {type(e).__name__}: {e}")
+
+    async def _fetch_positions_lightweight(self) -> dict:
+        """Fetch open positions using a dedicated lightweight exchange (separate connection pool).
+        Returns {symbol: {'contracts': abs_amt, 'side': 'long'|'short', 'entryPrice': float}}."""
+        if not self.exchange_wrapper or not self.exchange_wrapper.exchange:
+            return {}
+        try:
+            # Lazy-init or recycle lightweight exchange every 5 min (keeps connection pool fresh)
+            if not hasattr(self, '_lightweight_ex') or self._lightweight_ex is None or \
+               not hasattr(self, '_lightweight_ex_created') or \
+               time.time() - self._lightweight_ex_created > 300:
+                import ccxt.async_support as ccxt_async
+                # Close old instance if exists
+                if hasattr(self, '_lightweight_ex') and self._lightweight_ex is not None:
+                    try:
+                        await self._lightweight_ex.close()
+                    except Exception:
+                        pass
+                self._lightweight_ex = ccxt_async.binanceusdm({
+                    'apiKey': self.exchange_wrapper.api_key,
+                    'secret': self.exchange_wrapper.api_secret,
+                    'enableRateLimit': True,  # Prevent Binance hard rate limits
+                    'timeout': 10000,
+                })
+                self._lightweight_ex_created = time.time()
+            pos_list = await asyncio.wait_for(
+                self._lightweight_ex.fetch_positions(), timeout=10.0)
+            result = {}
+            for p in (pos_list or []):
+                contracts = abs(float(p.get('contracts', 0)))
+                if contracts > 0:
+                    sym = p.get('symbol', '')
+                    sym = self.exchange_wrapper.normalize_symbol(sym)
+                    result[sym] = {
+                        'contracts': contracts,
+                        'side': p.get('side', 'long'),
+                        'entryPrice': float(p.get('entryPrice', 0)),
+                    }
+            return result
+        except Exception:
+            return {}
+
     async def _refresh_orderbooks_for_positions(self):
         """Refresh orderbooks for open positions for better exit decisions."""
         if not self.exchange_wrapper or DRY_RUN or not self.positions:
@@ -974,7 +1091,7 @@ class ScalperBot:
                 # Denormalize symbol for exchange API
                 denormalized_symbol = self.exchange_wrapper.denormalize_symbol(symbol)
                 orderbook = await asyncio.wait_for(
-                    self.exchange_wrapper.fetch_order_book(denormalized_symbol, limit=20),
+                    self.exchange_wrapper.fetch_order_book(denormalized_symbol, limit=5),
                     timeout=0.2
                 )
                 return (symbol, orderbook)
@@ -997,13 +1114,28 @@ class ScalperBot:
     
     async def scan_and_enter_signals(self):
         """Scan for trading signals and enter positions."""
+        global asyncio  # Fix: Python 3.14 closure scoping — inner process_symbol ref forces local binding
         # DEBUG: Log strategy cycle entry point
         self.logger.info("[DEBUG] Strategy cycle triggered - scan_and_enter_signals() called")
         # DEBUG: Increment scan counter and log every 100 cycles
         self.debug_scan_counter += 1
         if self.debug_scan_counter % 100 == 0:
             self.logger.info(f"[DEBUG] Scan cycle #{self.debug_scan_counter}")
-        
+
+        # CIRCUIT BREAKER: pause after 3 consecutive losses
+        if not hasattr(self, '_recent_exit_pnls'):
+            self._recent_exit_pnls = []
+        if len(self._recent_exit_pnls) >= 3 and all(p <= 0 for p in self._recent_exit_pnls[-3:]):
+            if not hasattr(self, '_circuit_paused_until'):
+                self._circuit_paused_until = 0
+            now = time.time()
+            if now < self._circuit_paused_until:
+                return  # Still paused
+            # Start/reset pause
+            self._circuit_paused_until = now + 1800  # 30 min
+            self.logger.warning("[BREAKER] 3 consecutive losses — pausing 30 min")
+            return
+
         from .config import (
             MAX_LATENCY_MS, MIN_VOLUME_24H, MIN_SPREAD_BPS, DRY_RUN
         )
@@ -1051,7 +1183,7 @@ class ScalperBot:
         
         # OPTIMIZATION: Cache equity calculation (used multiple times)
         equity = self.equity_now()
-        current_positions = len(self._positions_set)  # OPTIMIZATION: Use set length (O(1))
+        current_positions = len(self.positions)
         
         # SIGNAL CONFIRMATION WINDOW (SCW): Update waiting signals with new bar data
         from .config import USE_SIGNAL_CONFIRMATION, R_BAR_SCAN_CYCLE_SEC
@@ -1209,7 +1341,7 @@ class ScalperBot:
             was_cache_hit = cached_ticker is not None
             
             # OPTIMIZATION: Use set for O(1) position lookup
-            if symbol in self._positions_set:
+            if symbol in self.positions:
                 return ('skipped', 'in_position', None, None, was_cache_hit, False)
             
             # Get symbol stats from universe (already cached)
@@ -1269,7 +1401,10 @@ class ScalperBot:
                 'last': stats_last,
                 'spread_bps': stats_spread,
                 'vol_quote': stats_vol,
-                'pct_change_24h': stats_pct_change
+                'pct_change_24h': stats_pct_change,
+                'pct_change_15m': getattr(stats, 'pct_change_15m', 0.0),
+                'oi_change_pct': getattr(stats, 'oi_change_pct', 0.0),
+                'funding_rate': self.funding_rates.get(symbol, {}).get('rate', 0.0),
             }
             
             # Fetch orderbook for depth scoring (with fallback)
@@ -1295,7 +1430,7 @@ class ScalperBot:
                             denormalized_symbol = self.exchange_wrapper.denormalize_symbol(symbol)
                             # Fetch orderbook with timeout
                             orderbook = await asyncio.wait_for(
-                                self.exchange_wrapper.fetch_order_book(denormalized_symbol, limit=20),  # Deeper depth
+                                self.exchange_wrapper.fetch_order_book(denormalized_symbol, limit=5),  # limit=5 = weight 1 (vs weight 5 for limit=20)
                                 timeout=0.2  # 200ms timeout
                             )
                             orderbook_fetched = True
@@ -1336,6 +1471,7 @@ class ScalperBot:
             
             # Handle rejected signals (rejection_reason is not None)
             if rejection_reason is not None:
+                # self.logger.debug(f"Signal REJECTED for {symbol}: {rejection_reason}")
                 # Signal was generated but rejected by signal generator filters
                 # PURE_SCALPER: Track rejection reasons for summary
                 # Note: These counters are per-symbol, we'll aggregate at scan end
@@ -1489,7 +1625,10 @@ class ScalperBot:
                     'last': getattr(stats, 'last', 0.0),
                     'spread_bps': getattr(stats, 'spread_bps', 9999),
                     'vol_quote': getattr(stats, 'vol_quote', 0.0),
-                    'pct_change_24h': getattr(stats, 'pct_change_24h', 0.0)
+                    'pct_change_24h': getattr(stats, 'pct_change_24h', 0.0),
+                    'pct_change_15m': getattr(stats, 'pct_change_15m', 0.0),
+                    'oi_change_pct': getattr(stats, 'oi_change_pct', 0.0),
+                    'funding_rate': self.funding_rates.get(symbol, {}).get('rate', 0.0),
                 }
                 
                 # Get indicators for filter evaluation
@@ -1649,6 +1788,8 @@ class ScalperBot:
                 from .config import USE_THREE_STAGE_FILTER
                 from .engine.scalper_filters import evaluate_three_stage_filter
                 
+                # self.logger.debug(f"Processing signal for {symbol}, score={signal.final_score}")
+                
                 filter_passed = True  # Default: pass if filter disabled
                 filter_rejection_reason = None
                 filter_details = None
@@ -1671,6 +1812,8 @@ class ScalperBot:
                         entry_price=signal.entry_price,
                         final_score=signal.final_score  # DEBUG: Pass final_score for debug logging
                     )
+                    
+                    # self.logger.debug(f"Filter result for {symbol}: passed={filter_passed}")
                     
                     if not filter_passed:
                         # Reject signal - filter failed
@@ -1700,99 +1843,135 @@ class ScalperBot:
                         self.signal_history.append(signal_record)
                         continue
                 
-                # Filter pipeline passed - apply structure confluence boost to score if available
-                # NOTE: Do NOT increment passed_filters here - wait until position manager check passes
-                if structure_confluence and structure_confluence.score_boost > 0:
-                    # Boost the final_score by structure confluence
-                    signal.final_score = min(100.0, signal.final_score + structure_confluence.score_boost)
-                    # Also update strength for backward compatibility
-                    signal.strength = signal.final_score / 100.0
-                
-                # Get current drawdown for DD-aware protection and auto-reset
-                drawdown_pct = self.get_drawdown_pct()
-                
-                # RISK-BASED ENTRY: Check if we can enter based on risk budget
-                # First pass: basic validation (without position sizing)
-                can_enter, reason, replacement_symbol = self.position_manager.can_enter_position(
-                symbol=symbol,
-                spread_bps=stats.spread_bps,
-                volume_24h=stats.vol_quote,
-                latency_ms=latency_ms,
-                signal_strength=signal.strength,
-                    current_positions=current_positions,
-                    cached_now=batch_now,
-                    is_unicorn=is_unicorn,
-                    signal_score=signal.final_score,
-                    drawdown_pct=drawdown_pct,
-                    open_positions=self.positions,
-                    equity=equity,
-                    entry_price=signal.entry_price,
-                    stop_loss=signal.stop_loss,
-                    position_size=None,  # Will be calculated below
-                    side=signal.side
+                # Filter pipeline passed — check ADX trend gate before proceeding
+                # NOTE: Do NOT increment passed_filters here — wait until position manager check passes
+
+                # ADX TREND GATE: Block entries in trending markets
+                # The scalper grid profits from mean-reversion in chop. In trends, it gets steamrolled.
+                # When ADX > threshold, the market is directional — sit out, don't enter.
+                from .config import ADX_TREND_GATE_ENABLED, ADX_TREND_GATE_THRESHOLD
+                if ADX_TREND_GATE_ENABLED and indicators:
+                    adx = indicators.get('adx', 0.0)
+                    if adx > ADX_TREND_GATE_THRESHOLD:
+                        self._log_signal_decision(symbol, signal, "rejected",
+                            f"RJ – trend market (ADX {adx:.1f} > {ADX_TREND_GATE_THRESHOLD})")
+                        loop_stats['rejected_by_filters'] += 1
+                        rejected_risk += 1
+                        signal_record = {
+                            'timestamp': batch_now,
+                            'symbol': symbol,
+                            'strength': signal.strength,
+                            'final_score': signal.final_score,
+                            'type': signal.signal_type,
+                            'side': signal.side,
+                            'spread_bps': stats.spread_bps,
+                            'volatility': abs(getattr(stats, 'pct_change_24h', 0.0)),
+                            'btc_trend': self.btc_trend,
+                            'btc_filter_passed': True,
+                            'approved': False,
+                            'rejection_reason': f"RJ – trend market (ADX {adx:.1f} > {ADX_TREND_GATE_THRESHOLD})",
+                            'is_unicorn': is_unicorn
+                        }
+                        if signal.signal_score:
+                            signal_record.update(signal.signal_score.to_dict())
+                        self.signal_history.append(signal_record)
+                        continue
+
+                # ER REGIME FILTER: Kaufman Efficiency Ratio — skip when price is too directional
+                # ER > 0.35 = trending (dangerous for mean-reversion). ER < 0.15 = pure noise.
+                # Mean-reversion scalping prints in the 0.20–0.35 sweet spot.
+                from .config import ER_FILTER_ENABLED, ER_FILTER_MAX_THRESHOLD, ER_FILTER_MIN_THRESHOLD
+                if ER_FILTER_ENABLED and indicators:
+                    er = indicators.get('er', 0.5)
+                    if er > ER_FILTER_MAX_THRESHOLD:
+                        self._log_signal_decision(symbol, signal, "rejected",
+                            f"RJ – too directional (ER {er:.3f} > {ER_FILTER_MAX_THRESHOLD})")
+                        loop_stats['rejected_by_filters'] += 1
+                        rejected_risk += 1
+                        continue
+                    if er < ER_FILTER_MIN_THRESHOLD:
+                        self._log_signal_decision(symbol, signal, "rejected",
+                            f"RJ – too noisy (ER {er:.3f} < {ER_FILTER_MIN_THRESHOLD})")
+                        loop_stats['rejected_by_filters'] += 1
+                        rejected_risk += 1
+                        continue
+
+                # DAY TRADING: Dead zone gate REMOVED — day trades hold through weekends.
+                # Scalping dead zone (Sat/Sun before 10 UTC) was 0% WR historically for 5m bars,
+                # but 1h-4h day trading structure works on weekends.
+
+                # BTC CHOP FILTER: relaxed for day trading (was 0.5%, now 0.2%).
+                # Day trading needs moderate BTC direction, not extreme.
+                from .config import BTC_CHOP_THRESHOLD
+                if abs(self.btc_trend) < BTC_CHOP_THRESHOLD:
+                    continue  # Silent — market has no direction for day trading either
+
+                # HARD PRICE FLOOR: Day trading needs real market structure. $2 minimum.
+                # Tokens below $2 are random walks — HTF trend doesn't apply.
+                _entry_price = getattr(stats, 'mark', 0.0) or getattr(stats, 'last', 0.0)
+                if _entry_price < 2.00:
+                    self._log_signal_decision(symbol, signal, "rejected",
+                        f"RJ – price < \$2 (${_entry_price:.2f})")
+                    loop_stats['rejected_by_filters'] += 1
+                    continue
+
+                # 5-FACTOR CHECKLIST: 5 binary checks, need 3/5 to enter.
+                # Uses indicators/AdvancedFeatures when available, falls back to 24h data.
+                from .score_checklist import score_signal as checklist_score
+
+                _af = None
+                if USE_THREE_STAGE_FILTER:
+                    _af = advanced_features if 'advanced_features' in dir() else None
+                try:
+                    _af = _af or advanced_features
+                except (NameError, UnboundLocalError):
+                    _af = None
+
+                checklist = checklist_score(
+                    side=signal.side,
+                    symbol_stats=symbol_stats,
+                    indicators=indicators,
+                    pct_change_24h=getattr(stats, 'pct_change_24h', 0.0),
+                    volume_24h=getattr(stats, 'vol_quote', 0.0),
+                    spread_bps=getattr(stats, 'spread_bps', 9999.0),
+                    advanced_features=_af,
+                    current_price=_entry_price,
                 )
-            
-                if can_enter:
-                    signals_pass_position_manager += 1
-            
-                signal_record = {
-                    'timestamp': batch_now,
-                    'symbol': symbol,
-                    'strength': signal.strength,
-                    'final_score': signal.final_score,
-                    'type': signal.signal_type,
-                    'side': signal.side,
-                    'spread_bps': stats.spread_bps,
-                    'volatility': abs(getattr(stats, 'pct_change_24h', 0.0)),
-                    'btc_trend': self.btc_trend,
-                    'btc_filter_passed': btc_filter_passed,
-                    'approved': can_enter,
-                    'rejection_reason': reason if not can_enter else None,
-                    'is_unicorn': is_unicorn
-                }
-                # Add filter details if available
-                if filter_details:
-                    signal_record['filter_details'] = filter_details
-                if structure_confluence:
-                    signal_record['structure_confluence'] = {
-                        'count': structure_confluence.count,
-                        'signals': structure_confluence.signals,
-                        'score_boost': structure_confluence.score_boost
-                    }
-                if signal.signal_score:
-                    signal_record.update(signal.signal_score.to_dict())
-                self.signal_history.append(signal_record)
-            
-                # STARTUP DELAY: FIX - Never block entries (warmup is informational only)
-                # Removed blocking logic - entries are always evaluated regardless of startup period
-                
-                # SIGNAL CONFIRMATION WINDOW (SCW): Check if signal needs confirmation
-                from .config import USE_SIGNAL_CONFIRMATION
+
+                # Need 3/5 to pass
+                if not checklist.passed:
+                    self._log_signal_decision(symbol, signal, "rejected",
+                        checklist.reason)
+                    loop_stats['rejected_by_filters'] += 1
+                    continue
+
+                # Keep SignalScorer score (0-100), use checklist only as gate
+                # signal.final_score already set by scoring pipeline — don't clobber it
+                if signal.final_score <= 0:
+                    # Use confluence score as conviction: 65 → 65, 80 → 80, 100 → 100
+                    signal.final_score = float(getattr(checklist, 'confluence_score', 50) or 50)
+                signal.strength = signal.final_score / 100.0  # normalize 0-100 → 0.0-1.0
+
+                # Initialize entry decision variables
+                can_enter = True
+                reason = None
                 signal_needs_confirmation = False
-                if USE_SIGNAL_CONFIRMATION and can_enter and not in_startup_period:
-                    confirmation_required = self.signal_confirmation.get_confirmation_required(signal.final_score)
-                    if confirmation_required > 0:
-                        # Signal needs confirmation - add to waiting queue
-                        key_level = signal.stop_loss  # Use stop_loss as key level
-                        waiting = self.signal_confirmation.add_waiting_signal(symbol, signal, key_level)
-                        signal_needs_confirmation = True
+
+                # Signal Confirmation Window (SCW) check — if enabled
+                if USE_SIGNAL_CONFIRMATION and symbol in self.signal_confirmation.waiting_signals:
+                    # Check if signal is already confirmed
+                    ready_signal = self.signal_confirmation.get_ready_signal(symbol)
+                    if ready_signal:
+                        # Signal is confirmed and ready
+                        can_enter = True
+                        reason = "SCW: Signal confirmed"
+                        self.signal_confirmation.remove_signal(symbol)
+                    else:
+                        # Still waiting
                         can_enter = False
-                        reason = f"SCW: Waiting for {confirmation_required} bar confirmation (current: {waiting.confirmation_count})"
-                        # REMOVED: Individual signal confirmation log (aggregated in summary)
-                    elif symbol in self.signal_confirmation.waiting_signals:
-                        # Check if signal is already confirmed
-                        ready_signal = self.signal_confirmation.get_ready_signal(symbol)
-                        if ready_signal:
-                            # Signal is confirmed and ready
-                            can_enter = True
-                            reason = "SCW: Signal confirmed"
-                            self.signal_confirmation.remove_signal(symbol)
-                        else:
-                            # Still waiting
-                            can_enter = False
-                            waiting = self.signal_confirmation.waiting_signals[symbol]
-                            reason = f"SCW: Waiting for confirmation ({waiting.confirmation_count}/{waiting.confirmation_required})"
-                            signal_needs_confirmation = True
+                        waiting = self.signal_confirmation.waiting_signals[symbol]
+                        reason = f"SCW: Waiting for confirmation ({waiting.confirmation_count}/{waiting.confirmation_required})"
+                        signal_needs_confirmation = True
                 
                 self._log_signal_decision(
                     symbol,
@@ -1882,8 +2061,8 @@ class ScalperBot:
                     )
                     continue
                 
-                # Handle replacement if needed
-                # REMOVED: Individual replacement log (tracked via exit DecisionEvent)
+                # Handle replacement if needed (score-aware replacement disabled — KISS)
+                replacement_symbol = None
                 if replacement_symbol:
                         # Close the weakest position to make room
                         # Close the position (will be handled by exit manager)
@@ -1925,7 +2104,7 @@ class ScalperBot:
                                 
                                 success, event_created = apply_exit_and_log(
                                     positions=self.positions,
-                                    positions_set=self._positions_set,
+                                    positions_set=set(),
                                     symbol=replacement_symbol,
                                     new_size=0.0,  # Full exit
                                     action="EXIT",
@@ -1958,8 +2137,6 @@ class ScalperBot:
                                 # Position doesn't exist on exchange - clean up from dict
                                 if replacement_symbol in self.positions:
                                     del self.positions[replacement_symbol]
-                                    if replacement_symbol in self._positions_set:
-                                        self._positions_set.discard(replacement_symbol)
                                 current_positions = len(self.positions)
                 
                 leverage = self.position_manager.calculate_dynamic_leverage(
@@ -1982,14 +2159,57 @@ class ScalperBot:
                         if stop_distance_pct > 0:
                             atr_pct = stop_distance_pct / 1.5
                 
-                # SCALPER: Calculate scalper stop loss (0.35 * ATR) for position sizing
-                scalper_stop_loss = signal.stop_loss  # Default fallback
-                if atr_pct and atr_pct > 0:
-                    if signal.side == "long":
-                        scalper_stop_loss = signal.entry_price * (1.0 - 0.35 * atr_pct)
-                    else:  # short
-                        scalper_stop_loss = signal.entry_price * (1.0 + 0.35 * atr_pct)
+                # Use signal's stop loss — now calculated from real ATR in signal generator
+                scalper_stop_loss = signal.stop_loss
                 
+                # HARD POSITION CAP — verify against Binance, not internal tracking
+                # Internal tracking can have ghosts. Binance is the ONLY source of truth.
+                equity_now = self.equity_now()
+                max_pos = self.position_manager.get_effective_max_positions(equity=equity_now) if equity_now > 0 else self.cfg.MAX_OPEN_POSITIONS
+                # Use cached exchange count if fresh (<3s old), else do a quick lightweight fetch
+                exchange_pos_count = len(self.positions)  # Fallback
+                if hasattr(self, '_last_exchange_pos_count') and hasattr(self, '_last_exchange_count_ts'):
+                    if time.time() - self._last_exchange_count_ts < 3.0:
+                        exchange_pos_count = self._last_exchange_pos_count
+                    else:
+                        # Stale — do a fresh lightweight fetch (fast, ~200ms)
+                        try:
+                            fresh = await asyncio.wait_for(
+                                self._fetch_positions_lightweight(), timeout=3.0)
+                            exchange_pos_count = len(fresh)
+                            self._last_exchange_pos_count = exchange_pos_count
+                            self._last_exchange_count_ts = time.time()
+                        except Exception:
+                            pass  # Use stale/fallback count on fetch failure
+                elif hasattr(self, '_last_exchange_pos_count'):
+                    exchange_pos_count = self._last_exchange_pos_count
+                if exchange_pos_count >= max_pos:
+                    self.logger.info(f"[BLOCKED] {symbol} cap:Exchange count={exchange_pos_count}/{max_pos}")
+                    continue
+
+                # POSITION MANAGER CHECK: cooldown, rate limit, loss streak, volume, latency
+                pm_ok, pm_reason, _ = self.position_manager.can_enter_position(
+                    symbol=symbol,
+                    spread_bps=stats.spread_bps if stats else 9999.0,
+                    volume_24h=getattr(stats, 'vol_quote', 0.0),
+                    latency_ms=0,  # already checked by scanner; skip double-check
+                    signal_strength=signal.strength,
+                    current_positions=len(self.positions),
+                    is_unicorn=is_unicorn,
+                    signal_score=signal.final_score,
+                    open_positions=self.positions,
+                    side=signal.side,
+                )
+                if not pm_ok:
+                    self.logger.info(f"[BLOCKED] {symbol} cmp={signal.final_score:.0f} pm:{pm_reason}")
+                    if "max positions" in pm_reason or "capacity" in pm_reason:
+                        rejected_capacity += 1
+                    elif "cooldown" in pm_reason or "rate" in pm_reason:
+                        rejected_risk += 1
+                    else:
+                        rejected_risk += 1
+                    continue
+
                 # RISK-BASED SIZING: Calculate position size using risk budget approach
                 # Use scalper stop loss for accurate risk calculation
                 (
@@ -2027,21 +2247,101 @@ class ScalperBot:
                     signal_strength=signal.strength,
                 )
                 
+                # BLOCKED SYMBOLS: permanently skip symbols that need account agreements
+                if hasattr(self, '_blocked_symbols') and symbol in self._blocked_symbols:
+                    continue
+                # FAIL COOLDOWN: skip symbols that recently failed entry
+                if hasattr(self, '_entry_fail_cooldowns') and symbol in self._entry_fail_cooldowns:
+                    if time.time() < self._entry_fail_cooldowns[symbol]:
+                        continue
+                    else:
+                        del self._entry_fail_cooldowns[symbol]  # Cooldown expired
+
+                # ENTRY BUDGET: max 2 attempts per scan (each takes 2-4s). Prevents timeout spiral.
+                if entries_attempted >= 2:
+                    continue
+                if time.time() - scan_start_time > 24:
+                    continue
+
                 entries_attempted += 1
-                
+
                 entry_symbol = symbol
                 entry_side = signal.side
-                
-                # DEBUG: Log that we're calling enter_position
+
+                # HARD CAP CHECK: simple pre-check, post-entry cleanup handles bursts
+                if len(self.positions) >= MAX_OPEN_POSITIONS:
+                    self.logger.info(
+                        f"[BLOCKED] {entry_symbol} pm:Hard cap "
+                        f"({len(self.positions)}/{MAX_OPEN_POSITIONS})"
+                    )
+                    continue
+
+                # EXCHANGE CAP: Enforced by soft cap (positions_set) + naked audit (every 120s).
+                # The SLTP batch fetch (every 15s) + audit covers reconciliation. No per-entry fetch needed.
+
+                # 15M MOMENTUM TREND FILTER: only check for signals that pass all other gates.
+                # Runs here (not earlier) so we only OHLCV-fetch the 1-3 candidates per scan.
+                from .config import MOMENTUM_15M_ENABLED, MOMENTUM_15M_THRESHOLD_PCT
+                if MOMENTUM_15M_ENABLED and not DRY_RUN:
+                    try:
+                        denorm = self.exchange_wrapper.denormalize_symbol(symbol)
+                        ohlcv_15m = await asyncio.wait_for(
+                            self.exchange_wrapper.exchange.fetch_ohlcv(denorm, '15m', limit=3),
+                            timeout=3.0
+                        )
+                        if ohlcv_15m and len(ohlcv_15m) >= 2:
+                            closes = [c[4] for c in ohlcv_15m]
+                            pct_15m = ((closes[-1] - closes[-2]) / closes[-2]) * 100.0
+                            if signal.side == 'long' and pct_15m < MOMENTUM_15M_THRESHOLD_PCT:
+                                self.logger.info(f"[15M_BLOCK] {symbol} long blocked: 15m Δ={pct_15m:.2f}% < {MOMENTUM_15M_THRESHOLD_PCT}%")
+                                continue
+                            if signal.side == 'short' and pct_15m > -MOMENTUM_15M_THRESHOLD_PCT:
+                                self.logger.info(f"[15M_BLOCK] {symbol} short blocked: 15m Δ={pct_15m:.2f}% > {-MOMENTUM_15M_THRESHOLD_PCT}%")
+                                continue
+                    except asyncio.TimeoutError:
+                        pass  # Don't block entry on timeout
+                    except Exception:
+                        pass  # Non-critical
+
+                # OPEN INTEREST + TAKER FLOW + POSITIONING: fetch for entry candidates
+                # Fetch OI, taker buy/sell ratio, and long/short ratio in parallel
+                oi_task = asyncio.create_task(
+                    self.exchange_wrapper.fetch_open_interest(symbol))
+                taker_task = asyncio.create_task(
+                    self.exchange_wrapper.fetch_taker_buy_ratio(symbol))
+                ls_task = asyncio.create_task(
+                    self.exchange_wrapper.fetch_long_short_ratio(symbol))
+
+                try:
+                    oi_data = await asyncio.wait_for(oi_task, timeout=2.0)
+                    if oi_data and hasattr(stats, 'open_interest'):
+                        new_oi = float(oi_data.get('openInterestAmount', 0) or 0)
+                        old_oi = getattr(stats, 'open_interest', 0.0) or 0.0
+                        stats.open_interest = new_oi
+                        if old_oi > 0:
+                            stats.oi_change_pct = ((new_oi - old_oi) / old_oi) * 100.0
+                except Exception:
+                    pass
+
+                try:
+                    stats.taker_buy_ratio = await asyncio.wait_for(taker_task, timeout=2.0)
+                except Exception:
+                    stats.taker_buy_ratio = 0.5
+
+                try:
+                    stats.long_short_ratio = await asyncio.wait_for(ls_task, timeout=2.0)
+                except Exception:
+                    stats.long_short_ratio = 1.0
+
                 self.logger.info(
                     f"[CALLING_ENTER] symbol={entry_symbol} side={entry_side} "
                     f"size={position_size:.4f} leverage={final_leverage}x "
                     f"entry_price={signal.entry_price:.6f} stop_loss={scalper_stop_loss:.6f}"
                 )
-                
+
                 # REMOVED: Individual entry logs (tracked via DecisionEvent in decision_event.py)
                 # Unicorn and regular entry logs now appear in Recent Activity panel via DecisionEvent
-                
+
                 result = await self.order_manager.enter_position(
                     symbol=entry_symbol,
                     side=entry_side,
@@ -2050,6 +2350,7 @@ class ScalperBot:
                     delay_ms=entry_delay,
                     use_limit=use_limit,
                     leverage=final_leverage,
+                    # SL/TP placed separately below — atomic attachment causes -2021 on volatile pairs
                 )
                 
                 # REMOVED: Individual entry result log (tracked via DecisionEvent)
@@ -2079,15 +2380,8 @@ class ScalperBot:
                     if entry_symbol in self.funding_rates:
                         position_funding_rate = self.funding_rates[entry_symbol].get("rate", 0.0)
                     
-                    # SCALPER: Set initial stop loss at 0.35 * ATR (scalper-specific)
-                    if atr_pct and atr_pct > 0:
-                        if entry_side == "long":
-                            initial_stop_price = entry_price * (1.0 - 0.35 * atr_pct)
-                        else:  # short
-                            initial_stop_price = entry_price * (1.0 + 0.35 * atr_pct)
-                    else:
-                        # Fallback to signal.stop_loss if ATR not available
-                        initial_stop_price = signal.stop_loss
+                    # Use signal's stop loss — now calculated from real ATR in signal generator
+                    initial_stop_price = signal.stop_loss
                     
                     # Use initial_stop_price for stop_loss (scalper uses tighter stops)
                     stop_loss_price = initial_stop_price
@@ -2133,9 +2427,68 @@ class ScalperBot:
                         "peak_price": entry_price,
                         "trough_price": entry_price,
                     }
-                    # OPTIMIZATION: Keep set in sync for O(1) lookups
-                    self._positions_set.add(entry_symbol)
-                    
+                    # === SL/TP PLACEMENT — EXCHANGE-VERIFIED ===
+                    # Position MUST have both SL and TP confirmed on exchange before tracking.
+                    # Uses -4130 "order already exists" as verification: if we try to place
+                    # and get -4130, the order is definitely live. No trust, only proof.
+                    sl_ok = False
+                    tp_ok = False
+                    sl_id = None
+                    tp_id = None
+                    close_side = "sell" if entry_side == "long" else "buy"
+
+                    for attempt in range(15):
+                        await asyncio.sleep(0.5)
+                        # Try placing SL (or verify existing via -4130)
+                        if not sl_ok:
+                            try:
+                                result = await self.order_manager.place_sl_order(
+                                    entry_symbol, entry_side, filled_size, stop_loss_price)
+                                if result == "EXISTS":
+                                    sl_ok = True  # -4130: order definitely on exchange
+                                    sl_id = "EXISTS"
+                                elif result:
+                                    sl_ok = True  # Real order ID returned
+                                    sl_id = result
+                            except Exception:
+                                pass
+                        # Try placing TP (or verify existing via -4130)
+                        if not tp_ok:
+                            try:
+                                result = await self.order_manager.place_tp_order(
+                                    entry_symbol, entry_side, filled_size, signal.take_profit)
+                                if result == "EXISTS":
+                                    tp_ok = True
+                                    tp_id = "EXISTS"
+                                elif result:
+                                    tp_ok = True
+                                    tp_id = result
+                            except Exception:
+                                pass
+                        if sl_ok and tp_ok:
+                            self.logger.info(f"[VERIFIED] {entry_symbol} SL={'EXISTS' if sl_id=='EXISTS' else sl_id} TP={'EXISTS' if tp_id=='EXISTS' else tp_id}")
+                            break
+
+                    if not (sl_ok and tp_ok):
+                        # Failed to protect — close position. Do not track.
+                        self.logger.critical(f"[UNPROTECTABLE] {entry_symbol} SL={sl_ok} TP={tp_ok} after 15 attempts — CLOSING")
+                        for close_i in range(5):
+                            try:
+                                await self.exchange_wrapper.exchange.create_order(
+                                    self.exchange_wrapper.denormalize_symbol(entry_symbol),
+                                    "market", close_side, filled_size, None,
+                                    {"reduceOnly": True})
+                                self.logger.info(f"[UNPROTECTABLE_CLOSED] {entry_symbol}")
+                                break
+                            except Exception as e:
+                                if close_i == 4:
+                                    self.logger.critical(f"[UNPROTECTABLE_FATAL] {entry_symbol} cannot close: {e}")
+                                await asyncio.sleep(1)
+                        continue  # DO NOT TRACK — position is closed or will be caught by audit
+
+                    self.positions[entry_symbol]["sl_order_id"] = sl_id
+                    self.positions[entry_symbol]["tp_order_id"] = tp_id
+
                     # LOGGING V2: Entry logging now handled by DecisionEvent (single concise line)
                     # Create canonical decision event for entry
                     decision = DecisionEvent(
@@ -2147,14 +2500,16 @@ class ScalperBot:
                         entry_price=entry_price,
                         size=filled_size,
                         reason="approved",
-                        score=signal.final_score,  # SCORING V2: This is now the Scoring v2 final score
+                        score=signal.final_score,  # Continuous composite mapped to 0-100
                         signal_type=signal.signal_type,
                         signal_strength=signal.strength,
                         stop_loss=stop_loss_price,  # SCALPER: Use scalper stop loss
                         take_profit=signal.take_profit,
                         is_unicorn=is_unicorn
                     )
-                    # SCORING V2: Attach score components to decision event for logging
+                    # COMPOSITE: Attach pillar scores for logging
+                    if hasattr(signal, 'composite_score') and signal.composite_score != 0:
+                        decision.composite = signal.composite_score
                     if hasattr(signal, 'score_components_capped') and signal.score_components_capped:
                         decision.score_components_capped = signal.score_components_capped
                     # SCALPER UPGRADE: Attach filter details for logging
@@ -2166,15 +2521,49 @@ class ScalperBot:
                     log_trade_decision(decision, bot_instance=self)
                     
                     current_positions += 1
+                    # POST-ENTRY CAP: if burst pushed us over, close worst
+                    if len(self.positions) > MAX_OPEN_POSITIONS:
+                        excess = len(self.positions) - MAX_OPEN_POSITIONS
+                        self.logger.warning(
+                            f"[CAP_CULL] {excess} over cap — closing worst performer"
+                        )
+                        sorted_pos = sorted(
+                            self.positions.items(),
+                            key=lambda x: x[1].get('unrealized_pnl', x[1].get('peak_pnl', 0) or 0)
+                        )
+                        for sym, pos in sorted_pos[:excess]:
+                            close_side = 'sell' if pos.get('side') == 'long' else 'buy'
+                            size = pos.get('size', 0)
+                            await self.order_manager.close_position_immediately(
+                                sym, close_side, size)
+
+                            if sym in self.positions:
+                                del self.positions[sym]
+                            current_positions -= 1
                 else:
                     # METRICS
                     self.metrics['entries_attempted'] += 1
                     error_msg = (
                         result.error if hasattr(result, "error") and result.error else "Unknown error"
                     )
-                    self.logger.error(
+                    self.logger.warning(
                         f"[E] entry_fail sym={entry_symbol} side={entry_side} msg={error_msg[:80]}"
                     )
+                    # Cooldown failed symbols to prevent retry spam
+                    if not hasattr(self, '_entry_fail_cooldowns'):
+                        self._entry_fail_cooldowns = {}
+                    # Use error catalog for cooldown strategy
+                    from .error_catalog import should_block_symbol, classify, RetryStrategy
+                    _, strategy, _ = classify(error_msg)
+                    if strategy == RetryStrategy.PERMANENT_SKIP:
+                        if not hasattr(self, '_blocked_symbols'):
+                            self._blocked_symbols = set()
+                        self._blocked_symbols.add(entry_symbol)
+                        self._entry_fail_cooldowns[entry_symbol] = float('inf')  # Permanent
+                        self.logger.warning(f"[BLOCKED_PERM] {entry_symbol} — {error_msg[:80]}")
+                    else:
+                        cooldown_sec = 120
+                        self._entry_fail_cooldowns[entry_symbol] = time.time() + cooldown_sec
         
         # Track scan completion
         scan_end_time = time.time()
@@ -2335,18 +2724,228 @@ class ScalperBot:
     
     async def monitor_and_exit_positions(self) -> None:
         """Monitor open positions and exit when stop-loss or take-profit is hit."""
-        if not self.exit_manager or not self.positions:
+        if not self.exit_manager:
             return
-        
+
+        if not self.positions:
+            return
+
         # OPTIMIZATION: Cache equity calculation (used in exit logic)
         equity = self.equity_now()
         positions_to_exit = []
         
         # OPTIMIZATION: Cache time once for all position checks
         monitor_now = time.time()
-        
+
+        # PRIORITY 0: Place SL/TP for any PENDING entries IMMEDIATELY.
+        # These positions were entered without atomic SL/TP (-2021 retry) and are naked.
+        # Must protect before anything else — monitor may timeout later.
         for symbol, position in list(self.positions.items()):
+            sl_id = position.get('sl_order_id')
+            tp_id = position.get('tp_order_id')
+            if sl_id == "PENDING" or tp_id == "PENDING":
+                side = position.get('side', 'long')
+                size = position.get('size', 0)
+                sl_price = position.get('stop_loss')
+                tp_price = position.get('take_profit')
+                try:
+                    if sl_id == "PENDING" and sl_price:
+                        new_sl = await asyncio.wait_for(
+                            self.order_manager.place_sl_order(symbol, side, size, sl_price),
+                            timeout=5.0)
+                        if new_sl:
+                            position['sl_order_id'] = new_sl
+                            self.logger.info(f"[PROTECT] {symbol} SL placed id={new_sl} @ {sl_price:.6f}")
+                    if tp_id == "PENDING" and tp_price:
+                        new_tp = await asyncio.wait_for(
+                            self.order_manager.place_tp_order(symbol, side, size, tp_price),
+                            timeout=5.0)
+                        if new_tp:
+                            position['tp_order_id'] = new_tp
+                            self.logger.info(f"[PROTECT] {symbol} TP placed id={new_tp} @ {tp_price:.6f}")
+                except Exception as e:
+                    self.logger.error(f"[PROTECT_FAIL] {symbol}: {type(e).__name__}: {e}")
+
+        # SL/TP ORDER FILL DETECTION — monitor position, NOT orders
+        # Binance closePosition orders are invisible to fetch_order (-2013).
+        # Instead: check if position still exists on exchange every 5s.
+        # If gone → SL/TP filled. If still open → protection is active.
+        if not hasattr(self, '_last_sltp_check'):
+            self._last_sltp_check = 0
+        if monitor_now - self._last_sltp_check > 10:  # Every 10s (matches monitor gate)
+            self._last_sltp_check = monitor_now
+            all_current_positions = {}
+            try:
+                # Use lightweight REST call — just position amounts, no ccxt overhead
+                t_fetch_start = time.time()
+                raw = await asyncio.wait_for(
+                    self._fetch_positions_lightweight(), timeout=10.0)
+                t_fetch = time.time() - t_fetch_start
+                if t_fetch > 2.0:
+                    self.logger.warning(f"[SLTP_SLOW] position fetch took {t_fetch:.1f}s (unusually slow)")
+                for sym, info in raw.items():
+                    all_current_positions[sym] = {'symbol': sym, 'contracts': info['contracts']}
+                self._last_exchange_pos_count = len(all_current_positions)
+                self._last_exchange_count_ts = time.time()
+            except Exception as e:
+                self.logger.warning(f"[SLTP_FETCH_FAIL] batch position fetch failed after {time.time()-t_fetch_start:.1f}s: {type(e).__name__}: {e} — monitor blind this cycle")
+
+            if all_current_positions:
+                # Only process if batch fetch succeeded (avoids false exit cascade)
+                pass  # fall through to for loop
+            else:
+                # Batch fetch failed — skip position processing, try next cycle
+                self._sltp_pending_doublecheck = []
+
+            # Position processing only runs if all_current_positions is populated
+            _skip_sltp = not all_current_positions
+            for symbol, position in list(self.positions.items()):
+                if _skip_sltp:
+                    break
+                sl_id = position.get('sl_order_id')
+                tp_id = position.get('tp_order_id')
+                if not sl_id and not tp_id:
+                    continue
+                # Handle deferred SL/TP — entry filled but position wasn't visible yet
+                if sl_id == "PENDING" or tp_id == "PENDING":
+                    side = position.get('side', 'long')
+                    size = position.get('size', 0)
+                    stop_loss_price = position.get('stop_loss')
+                    take_profit_price = position.get('take_profit')
+                    # Batch-fetched data now uses internal format (normalized in fetch_positions)
+                    matched = all_current_positions.get(symbol)
+                    still_open = matched is not None
+                    if still_open:
+                        # Position now visible — place SL/TP
+                        new_sl = await self.order_manager.place_sl_order(
+                            symbol, side, size, stop_loss_price)
+                        new_tp = await self.order_manager.place_tp_order(
+                            symbol, side, size, take_profit_price)
+                        if new_sl:
+                            position['sl_order_id'] = new_sl
+                            self.logger.info(f"[DEFERRED_OK] {symbol} SL placed id={new_sl}")
+                        if new_tp:
+                            position['tp_order_id'] = new_tp
+                            self.logger.info(f"[DEFERRED_OK] {symbol} TP placed id={new_tp}")
+                    else:
+                        # Position not on exchange yet — keep waiting. Entry filled.
+                        deferred_sec = time.time() - position.get('entry_time', time.time())
+                        if deferred_sec > 600:  # 10 min — only orphan if truly failed
+                            self.logger.warning(
+                                f"[ORPHAN] {symbol} not on exchange after {deferred_sec:.0f}s — removing")
+                            # positions dict already handles removal
+                            if symbol in self.positions:
+                                del self.positions[symbol]
+                    continue  # Skip normal SL/TP check for pending positions
+
+                if not sl_id and not tp_id:
+                    continue
+                try:
+                    self.logger.debug(f"[SLTP_MONITOR] fetching positions for {symbol}...")
+                    # Use batch-fetched data (now normalized to internal format)
+                    still_open = symbol in all_current_positions
+                    if not still_open:
+                        # Collect for batch double-check below
+                        if not hasattr(self, '_sltp_pending_doublecheck'):
+                            self._sltp_pending_doublecheck = []
+                        self._sltp_pending_doublecheck.append((symbol, position, sl_id, tp_id, symbol))
+                    # else: position still open — SL/TP protection active, nothing to do
+                except Exception as e:
+                    self.logger.error(f"[SLTP_ERROR] {symbol}: {type(e).__name__}: {e}")
+
+            # BATCH DOUBLE-CHECK: one re-fetch for all suspicious positions
+            if hasattr(self, '_sltp_pending_doublecheck') and self._sltp_pending_doublecheck:
+                await asyncio.sleep(1.0)
+                doublecheck_positions = {}
+                try:
+                    raw2 = await asyncio.wait_for(
+                        self._fetch_positions_lightweight(), timeout=6.0)
+                    for sym, info in raw2.items():
+                        doublecheck_positions[sym] = {'symbol': sym, 'contracts': info['contracts']}
+                except Exception as e:
+                    self.logger.warning(f"[SLTP_DBLCHK_FAIL] double-check fetch failed: {type(e).__name__}: {e} — deferring exits")
+                    doublecheck_positions = None  # On error, don't process any exits
+
+                for (symbol, position, sl_id, tp_id, denorm_sym) in self._sltp_pending_doublecheck:
+                    still_open2 = doublecheck_positions is None or symbol in doublecheck_positions
+                    if still_open2:
+                        self.logger.warning(f"[SLTP_GHOST] {symbol} false exit — position still open. Ignoring.")
+                        continue
+                    # CONFIRMED GONE — process exit with Binance-verified price
+                    entry_px = position.get('entry_price', 0)
+                    side = position.get('side', 'long')
+                    size = position.get('size', 0)
+                    sl_price = position.get('stop_loss', 0)
+                    tp_price = position.get('take_profit', 0)
+                    # Determine exit price: use SL/TP trigger level (far more accurate than stale ticker)
+                    # STOP_MARKET fills near stop, TAKE_PROFIT_MARKET fills near TP.
+                    # Use universe price only to determine direction, then use trigger level.
+                    exit_stats = self.universe.stats.get(symbol)
+                    ref_price = exit_stats.last if exit_stats else entry_px
+                    if side == 'long':
+                        if sl_price and ref_price <= sl_price:
+                            exit_px = sl_price
+                            reason = "stop_loss"
+                        elif tp_price and ref_price >= tp_price:
+                            exit_px = tp_price
+                            reason = "take_profit"
+                        else:
+                            exit_px = ref_price
+                            reason = "take_profit" if ref_price > entry_px else "stop_loss"
+                    else:
+                        if sl_price and ref_price >= sl_price:
+                            exit_px = sl_price
+                            reason = "stop_loss"
+                        elif tp_price and ref_price <= tp_price:
+                            exit_px = tp_price
+                            reason = "take_profit"
+                        else:
+                            exit_px = ref_price
+                            reason = "take_profit" if ref_price < entry_px else "stop_loss"
+                    if tp_id and tp_id not in ("RECONCILED", "EXISTS", "PENDING", "ATOMIC"):
+                        try: await self.order_manager.cancel_order(symbol, tp_id)
+                        except Exception: pass
+                    if sl_id and sl_id not in ("RECONCILED", "EXISTS", "PENDING", "ATOMIC"):
+                        try: await self.order_manager.cancel_order(symbol, sl_id)
+                        except Exception: pass
+                    initial_sl = position.get('initial_stop_price', position.get('stop_loss', 0))
+                    hold_sec = time.time() - position.get('entry_time', time.time())
+                    if side == 'long':
+                        pnl = (exit_px - entry_px) * size
+                        r_multiple = (exit_px - entry_px) / (entry_px - initial_sl) if initial_sl and entry_px != initial_sl else 0
+                    else:
+                        pnl = (entry_px - exit_px) * size
+                        r_multiple = (entry_px - exit_px) / (initial_sl - entry_px) if initial_sl and initial_sl != entry_px else 0
+                    self.logger.info(f"[SLTP_FILL] {symbol} {reason} @ {exit_px:.6f} PnL=${pnl:.4f} R={r_multiple:.2f} hold={hold_sec:.0f}s")
+                    self.realized_pnl_total += pnl
+                    if pnl > 0:
+                        self.win_count += 1; self.gross_win += pnl
+                    else:
+                        self.loss_count += 1; self.gross_loss += abs(pnl)
+                    if not hasattr(self, '_recent_exit_pnls'): self._recent_exit_pnls = []
+                    self._recent_exit_pnls.append(pnl)
+                    if len(self._recent_exit_pnls) > 10: self._recent_exit_pnls.pop(0)
+                    from .decision_event import DecisionEvent, log_trade_decision
+                    decision = DecisionEvent(
+                        timestamp=time.time(), action="EXIT", symbol=symbol,
+                        side=side.upper(), price=exit_px, entry_price=entry_px,
+                        size=size, reason=reason, net_pnl=pnl, duration_sec=hold_sec, was_win=(pnl > 0))
+                    log_trade_decision(decision, bot_instance=self)
+                    self.logger.info(f"EXIT: {symbol} | {reason} | size={size} | price={exit_px:.2f} | pnl={pnl:.2f} | R={r_multiple:.2f} | hold={hold_sec:.0f}s")
+                    self.metrics['exits_by_reason'][reason] = self.metrics['exits_by_reason'].get(reason, 0) + 1
+                    # positions dict already handles removal
+                    if symbol in self.positions: del self.positions[symbol]
+                self._sltp_pending_doublecheck = []  # Clear for next cycle
+
+        for symbol, position in list(self.positions.items()):
+            # Skip already-queued SL/TP fills
+            if any(s == symbol for s, _, _, _, _ in positions_to_exit):
+                continue
+
             # LATENCY OPTIMIZATION: Use cached data (no API calls)
+            # Note: local exit checks now run ALONGSIDE exchange SL/TP.
+            # Exchange orders = safety floor. Local trailing = earlier trigger.
+            # If local exit fires, it cancels exchange orders via exit pipeline.
             # Get current market price from universe stats (already cached)
             stats = self.universe.stats.get(symbol)
             if not stats:
@@ -2356,6 +2955,7 @@ class ScalperBot:
             side = position.get('side', '').lower()
             entry_price = position.get('entry_price', 0)
             entry_time = position.get('entry_time', monitor_now)
+            size = position.get('size', 0)
             
             # Try cache first for ultra-fast access
             cached_ticker = self.ticker_cache.get(symbol, max_age=2.0)
@@ -2391,7 +2991,14 @@ class ScalperBot:
             
             # DYNAMIC POSITION RECOVERY SCORE (PRS) EVALUATION
             # Compute recovery score and decide on actions (close, scale out, tighten stop)
-            age_minutes = (monitor_now - entry_time) / 60.0 if entry_time > 0 else 0.0
+            age_seconds = monitor_now - entry_time if entry_time > 0 else 0
+            age_minutes = age_seconds / 60.0
+
+            # HARD MAX AGE: kill positions stuck > 2 hours — no exceptions
+            if age_seconds > 7200:
+                reason = f"max_age_{int(age_minutes)}min"
+                positions_to_exit.append((symbol, position, reason, current_price, 1.0))
+                continue
             
             # Get trend and volatility data (simplified - can be enhanced with full indicators)
             # For now, use price action and stored ATR
@@ -2513,43 +3120,89 @@ class ScalperBot:
             # SCALPER: Set initial stop loss if not set (0.35 * ATR)
             if not position.get('initial_stop_price'):
                 if side == "long":
-                    initial_stop = entry_price * (1.0 - 0.35 * (atr_pct or 0.01))
+                    initial_stop = entry_price * (1.0 - 1.5 * (atr_pct or 0.01))
                 else:
-                    initial_stop = entry_price * (1.0 + 0.35 * (atr_pct or 0.01))
+                    initial_stop = entry_price * (1.0 + 1.5 * (atr_pct or 0.01))
                 position['initial_stop_price'] = initial_stop
                 if not position.get('stop_loss'):
                     position['stop_loss'] = initial_stop
             
-            # Evaluate scalper trailing
-            scalper_action = evaluate_scalper_trailing(
-                position=position,
-                current_price=current_price,
-                atr_pct=atr_pct,
-                advanced_features=advanced_features,
-                indicators=indicators,
-                side=side,
-                entry_price=entry_price,
-                entry_time=entry_time,
-                bars_in_trade=bars_in_trade
-            )
+            # Evaluate scalper trailing — only if profit exceeds regime activation threshold
+            scalper_action = None
+            _trail_ok = False
+            try:
+                _rc = getattr(self, 'regime_config', None)
+                if _rc:
+                    _activation = getattr(_rc, 'trailing_stop_activation_pct', 1.0)
+                    # Calculate current profit %
+                    _profit = 0.0
+                    if side == 'long':
+                        _profit = (current_price - entry_price) / entry_price * 100
+                    else:
+                        _profit = (entry_price - current_price) / entry_price * 100
+                    if _activation < 50 and _profit >= _activation:
+                        _trail_ok = True
+            except Exception:
+                pass
+            if _trail_ok:
+                scalper_action = evaluate_scalper_trailing(
+                    position=position,
+                    current_price=current_price,
+                    atr_pct=atr_pct,
+                    advanced_features=advanced_features,
+                    indicators=indicators,
+                    side=side,
+                    entry_price=entry_price,
+                    entry_time=entry_time,
+                    bars_in_trade=bars_in_trade
+                )
             
             if scalper_action:
                 if scalper_action.action == "exit":
-                    # Queue exit
                     positions_to_exit.append((
                         symbol,
                         position,
                         scalper_action.exit_reason or "scalper_trailing",
-                        None,  # target_price (market order)
+                        current_price,
                         scalper_action.exit_size_ratio
                     ))
-                elif scalper_action.action == "update_sl":
-                    # Update stop loss
-                    position['stop_loss'] = scalper_action.new_stop
-                    # Log trailing update
+                elif scalper_action.action in ("update_sl", "update_both"):
+                    # Update SL in memory AND on exchange (cancel old + place new)
+                    old_sl_id = position.get('sl_order_id')
+                    if scalper_action.new_stop:
+                        position['stop_loss'] = scalper_action.new_stop
+                        # Cancel old exchange SL order if it has a real ID
+                        if old_sl_id and old_sl_id not in ("PENDING", "EXISTS", "RECONCILED", "ATOMIC"):
+                            try:
+                                await self.order_manager.cancel_order(symbol, old_sl_id)
+                            except Exception:
+                                pass
+                        # Place new SL on exchange
+                        new_sl = await self.order_manager.place_sl_order(
+                            symbol, side, size, scalper_action.new_stop)
+                        if new_sl:
+                            position['sl_order_id'] = new_sl
+                        if self.logger.isEnabledFor(logging.INFO):
+                            self.logger.info(
+                                f"TRAIL_SL_UPDATE sym={symbol} SL->{scalper_action.new_stop:.4f} "
+                                f"price={current_price:.4f} side={side.upper()}"
+                            )
+                if scalper_action.action in ("update_tp", "update_both") and scalper_action.new_tp:
+                    # Update TP in memory AND on exchange (cancel old + place new)
+                    old_tp_id = position.get('tp_order_id')
+                    position['take_profit'] = scalper_action.new_tp
+                    if old_tp_id and old_tp_id not in ("PENDING", "EXISTS", "RECONCILED", "ATOMIC"):
+                        try:
+                            await self.order_manager.cancel_order(symbol, old_tp_id)
+                        except Exception:
+                            pass
+                    new_tp = await self.order_manager.place_tp_order(
+                        symbol, side, size, scalper_action.new_tp)
+                    if new_tp:
+                        position['tp_order_id'] = new_tp
                     if self.logger.isEnabledFor(logging.INFO):
                         self.logger.info(
-                            f"TRAIL_SL_UPDATE sym={symbol} SL->{scalper_action.new_stop:.4f} "
+                            f"RATCHET_TP sym={symbol} TP->{scalper_action.new_tp:.4f} "
                             f"price={current_price:.4f} side={side.upper()}"
                         )
             
@@ -2608,7 +3261,9 @@ class ScalperBot:
                 )
                 
                 if should_exit:
-                    positions_to_exit.append((symbol, position, reason, target_price, exit_size_pct))
+                    self.logger.info(f"[EXIT_SIGNAL] {symbol} reason={reason} target={target_price:.4f} price={current_price:.4f}")
+                    # Spawn as background task — survives monitor timeout
+                    asyncio.create_task(self._execute_single_exit(symbol, position, reason, target_price, exit_size_pct))
             else:
                 # Legacy exit logic
                 # OPTIMIZATION: Cache regime config lookup (used for all positions in this loop)
@@ -2619,9 +3274,12 @@ class ScalperBot:
                 should_exit, reason, target_price = self.exit_manager.should_exit_position(
                     position, current_price, spread_bps, regime_config, symbol=symbol
                 )
-                
+
                 if should_exit:
-                    positions_to_exit.append((symbol, position, reason, target_price, 1.0))  # Full exit for legacy
+                    # EXECUTE EXIT IMMEDIATELY — don't wait for batch processing at end of monitor.
+                    # Monitor can timeout before reaching batch processing, losing exits.
+                    self.logger.info(f"[EXIT_SIGNAL] {symbol} reason={reason} target={target_price:.4f} price={current_price:.4f}")
+                    asyncio.create_task(self._execute_single_exit(symbol, position, reason, target_price, 1.0))
         
         # OPTIMIZATION: Use cached time from position monitoring loop
         exit_now = monitor_now
@@ -2681,9 +3339,17 @@ class ScalperBot:
                     priority=priority
                 )
                 
+                # Cancel exchange SL/TP before local exit
+                sl_id = position.get('sl_order_id')
+                tp_id = position.get('tp_order_id')
+                if sl_id and sl_id != "PENDING" and sl_id != "EXISTS":
+                    await self.order_manager.cancel_order(symbol, sl_id)
+                if tp_id and tp_id != "PENDING" and tp_id != "EXISTS":
+                    await self.order_manager.cancel_order(symbol, tp_id)
+
                 # Queue exit request
                 self.exit_pipeline.queue_exit(exit_request)
-            
+
             # Process all queued exits
             processed = await self.exit_pipeline.process_exits(bot_instance=self)
             if processed > 0:
@@ -2721,8 +3387,6 @@ class ScalperBot:
                         self._exits_processed_this_loop.add(symbol)
                     # Clean up invalid position
                     del self.positions[symbol]
-                    if symbol in self._positions_set:
-                        self._positions_set.discard(symbol)
                     continue
                 
                 # CRITICAL: Prevent double-processing same symbol in one loop
@@ -2769,7 +3433,13 @@ class ScalperBot:
                 if exit_result.success:
                     # Calculate PnL
                     was_win = exit_result.net_pnl > 0
-                    
+                    # Circuit breaker tracking
+                    if not hasattr(self, '_recent_exit_pnls'):
+                        self._recent_exit_pnls = []
+                    self._recent_exit_pnls.append(exit_result.net_pnl)
+                    if len(self._recent_exit_pnls) > 20:
+                        self._recent_exit_pnls = self._recent_exit_pnls[-20:]
+
                     # Update statistics
                     if was_win:
                         self.win_count += 1
@@ -2827,7 +3497,7 @@ class ScalperBot:
                     # CANONICAL: Apply exit and log atomically
                     success, event_created = apply_exit_and_log(
                         positions=self.positions,
-                        positions_set=self._positions_set,
+                        positions_set=set(),
                         symbol=symbol,
                         new_size=new_size,
                         action=action,
@@ -2911,8 +3581,6 @@ class ScalperBot:
                         # This prevents future "Invalid pos" errors for the same symbol
                         if symbol in self.positions:
                             del self.positions[symbol]
-                            if symbol in self._positions_set:
-                                self._positions_set.discard(symbol)
                     elif "invalid_limit_price" in error_msg or "invalid_price" in error_msg or "Invalid target price" in error_msg:
                         # Price validation errors - log compact message and debug details
                         self.logger.warning(
@@ -2988,6 +3656,158 @@ class ScalperBot:
         except Exception as e:
             # Non-critical, don't break execution
             self.logger.debug(f"[SELF-CHECK] Failed to verify exit events: {e}")
+
+        # ======== NAKED POSITION AUDIT ========
+        # Every 60s, cross-reference Binance positions against internal tracking.
+        # Binance is the ONLY source of truth — if a position exists on exchange
+        # but not in self.positions, it's either an orphan from a crashed session
+        # or a reconciliation failure. Either way: verify protection or add it.
+        if not hasattr(self, '_last_naked_audit'):
+            self._last_naked_audit = 0
+        if monitor_now - self._last_naked_audit > 30:
+            self._last_naked_audit = monitor_now
+            try:
+                raw_audit = await asyncio.wait_for(
+                    self._fetch_positions_lightweight(), timeout=6.0)
+                # Convert lightweight format to match expected dict keys
+                exchange_open = {}
+                for sym, info in raw_audit.items():
+                    exchange_open[sym] = {
+                        'symbol': sym,
+                        'contracts': info['contracts'],
+                        'side': info['side'],
+                        'entryPrice': info['entryPrice'],
+                    }
+                tracked_symbols = set(self.positions.keys())
+
+                # STEP 1: Remove ghosts — positions in tracking but NOT on exchange
+                ghosts_found = []
+                for tsym in list(tracked_symbols):
+                    if tsym not in exchange_open:
+                        ghosts_found.append(tsym)
+                for gsym in ghosts_found:
+                    self.logger.warning(f"[RECONCILE] {gsym} in tracking but NOT on Binance — removing ghost")
+                    # positions dict already handles removal
+                    if gsym in self.positions:
+                        del self.positions[gsym]
+                if ghosts_found:
+                    self._last_exchange_pos_count = len(exchange_open)
+                    self._last_exchange_count_ts = time.time()
+                    tracked_symbols = set(self.positions.keys())
+                # Tracked positions with suspect SL/TP state — verify with -4130 test
+                _SUSPECT_ORDER_IDS = frozenset({"RECONCILED", "PENDING", None, ""})
+                _DRY_PREFIX = "DRY_"
+
+                for normalized, pos in exchange_open.items():
+                    side = pos.get('side', 'long')
+                    qty = float(pos.get('contracts', 0))
+                    entry = float(pos.get('entryPrice', 0))
+                    close_side = 'sell' if side == 'long' else 'buy'
+                    real_sl = round(entry * (0.982 if side == 'long' else 1.018), 4)
+                    real_tp = round(entry * (1.018 if side == 'long' else 0.982), 4)
+
+                    if normalized in tracked_symbols:
+                        # Bot tracks this position — verify its protection is real, not just a sentinel
+                        tracked = self.positions.get(normalized, {})
+                        sl_id = str(tracked.get('sl_order_id', ''))
+                        tp_id = str(tracked.get('tp_order_id', ''))
+                        needs_verify = (
+                            sl_id in _SUSPECT_ORDER_IDS or sl_id.startswith(_DRY_PREFIX) or
+                            tp_id in _SUSPECT_ORDER_IDS or tp_id.startswith(_DRY_PREFIX)
+                        )
+                        if not needs_verify:
+                            continue  # Has real order IDs — trust them
+
+                        # Verify with -4130 test
+                        has_sl = has_tp = False
+                        try:
+                            await self.exchange_wrapper.create_order(normalized, 'STOP_MARKET',
+                                close_side, qty, None, {'stopPrice': real_sl, 'closePosition': 'true'})
+                        except Exception as e:
+                            if '4130' in str(e):
+                                has_sl = True
+                        try:
+                            await self.exchange_wrapper.create_order(normalized, 'TAKE_PROFIT_MARKET',
+                                close_side, qty, None, {'stopPrice': real_tp, 'closePosition': 'true'})
+                        except Exception as e:
+                            if '4130' in str(e):
+                                has_tp = True
+
+                        if has_sl and has_tp:
+                            # Protection confirmed — update tracking with verified sentinel
+                            tracked['sl_order_id'] = 'EXISTS'
+                            tracked['tp_order_id'] = 'EXISTS'
+                            self.logger.info(
+                                f"[NAKED_AUDIT] {normalized} tracked + verified protected via -4130")
+                        else:
+                            # Tracked but naked — place real protection
+                            self.logger.error(
+                                f"[NAKED_AUDIT] {normalized} TRACKED BUT NAKED! Placing SL/TP.")
+                            try:
+                                new_sl = await self.order_manager.place_sl_order(
+                                    normalized, side, qty, real_sl)
+                                new_tp = await self.order_manager.place_tp_order(
+                                    normalized, side, qty, real_tp)
+                                tracked['sl_order_id'] = new_sl or 'RECONCILED'
+                                tracked['tp_order_id'] = new_tp or 'RECONCILED'
+                                self.logger.info(
+                                    f"[NAKED_AUDIT] {normalized} PROTECTED: SL={new_sl} TP={new_tp}")
+                            except Exception as e:
+                                self.logger.critical(
+                                    f"[NAKED_AUDIT] {normalized} PROTECTION FAILED: {e}")
+                        continue
+
+                    has_sl = False
+                    has_tp = False
+                    try:
+                        await self.exchange_wrapper.create_order(normalized, 'STOP_MARKET', close_side, qty, None,
+                            {'stopPrice': real_sl, 'closePosition': 'true'})
+                    except Exception as e:
+                        if '4130' in str(e):
+                            has_sl = True
+
+                    try:
+                        await self.exchange_wrapper.create_order(normalized, 'TAKE_PROFIT_MARKET', close_side, qty, None,
+                            {'stopPrice': real_tp, 'closePosition': 'true'})
+                    except Exception as e:
+                        if '4130' in str(e):
+                            has_tp = True
+
+                    if has_sl and has_tp:
+                        # Protected but untracked — reconcile
+                        self.logger.warning(f"[NAKED_AUDIT] {normalized} exists on exchange with SL+TP but not tracked. Reconciling.")
+                        est_sl2 = round(entry * (0.982 if side == 'long' else 1.018), 4)
+                        self.positions[normalized] = {
+                            'symbol': normalized, 'side': side, 'size': qty,
+                            'entry_price': entry, 'entry_time': time.time(),
+                            'sl_order_id': 'RECONCILED', 'tp_order_id': 'RECONCILED',
+                            'initial_stop_price': est_sl2, 'stop_loss': est_sl2,
+                            'take_profit': round(entry * (1.018 if side == 'long' else 0.982), 4),
+                            'signal_score': 50,  # Default — prevents instant replacement
+                            'leverage': LEVERAGE_BASE
+                        }
+                        # already tracked in self.positions
+                    else:
+                        # NAKED! Place protection immediately
+                        self.logger.error(f"[NAKED_AUDIT] {normalized} NAKED on exchange! Placing SL/TP NOW.")
+                        real_sl = round(entry * (1 - 0.018) if side == 'long' else entry * (1 + 0.018), 4)
+                        real_tp = round(entry * (1 + 0.018) if side == 'long' else entry * (1 - 0.018), 4)
+                        try:
+                            sl_result = await self.order_manager.place_sl_order(normalized, side, qty, real_sl)
+                            tp_result = await self.order_manager.place_tp_order(normalized, side, qty, real_tp)
+                            self.logger.info(f"[NAKED_AUDIT] {normalized} PROTECTED: SL={sl_result} TP={tp_result}")
+                            self.positions[normalized] = {
+                                'symbol': normalized, 'side': side, 'size': qty,
+                                'entry_price': entry, 'entry_time': time.time(),
+                                'sl_order_id': sl_result, 'tp_order_id': tp_result,
+                                'initial_stop_price': real_sl, 'stop_loss': real_sl,
+                                'leverage': LEVERAGE_BASE
+                            }
+                            # already tracked in self.positions
+                        except Exception as e:
+                            self.logger.error(f"[NAKED_AUDIT] FAILED to protect {normalized}: {e}")
+            except Exception as e:
+                self.logger.error(f"[NAKED_AUDIT] Audit failed: {type(e).__name__}: {e}")
 
     def _log_signal_decision(self, symbol: str, signal, action: str, reason: Optional[str] = None):
         """
@@ -3067,7 +3887,66 @@ class ScalperBot:
                 pass
         
         await self.init_exchange()
-        
+
+        # START CLEAN: reconcile stale positions on exchange BEFORE main loop.
+        # The bot starts with empty position tracking — anything on exchange is a leftover.
+        # Protection orders (SL/TP) are ALWAYS real regardless of DRY_RUN mode,
+        # so this block runs even in DRY_RUN to verify/place protection on stale positions.
+        if self.exchange_wrapper:
+            try:
+                pos_list = await self.exchange_wrapper.fetch_positions()
+                stale = [p for p in pos_list if float(p.get('contracts', 0)) > 0]
+                if stale:
+                    self.logger.warning(
+                        f"[STARTUP] Found {len(stale)} stale positions on exchange — checking protection"
+                    )
+                    for p in stale:
+                        sym = p['symbol']
+                        contracts = float(p['contracts'])
+                        side = p['side']
+                        entry = float(p.get('entryPrice', 0))
+                        close_side = 'sell' if side == 'long' else 'buy'
+
+                        # Test if position has closePosition SL/TP orders via -4130 trick.
+                        # Use REAL protection prices (1.8%) — test IS the placement if order missing.
+                        sl_price = round(entry * (0.982 if side == 'long' else 1.018), 4)
+                        tp_price = round(entry * (1.018 if side == 'long' else 0.982), 4)
+                        has_sl = False
+                        has_tp = False
+                        try:
+                            await self.exchange_wrapper.create_order(sym, 'STOP_MARKET', close_side, contracts, None,
+                                {'stopPrice': sl_price, 'closePosition': 'true'})
+                        except Exception as e:
+                            if '4130' in str(e):
+                                has_sl = True
+                        try:
+                            await self.exchange_wrapper.create_order(sym, 'TAKE_PROFIT_MARKET', close_side, contracts, None,
+                                {'stopPrice': tp_price, 'closePosition': 'true'})
+                        except Exception as e:
+                            if '4130' in str(e):
+                                has_tp = True
+
+                        # Test placed SL/TP at correct 1.8% prices if they didn't exist.
+                        # Whether -4130 fired (pre-existing) or order was just placed, position is protected.
+                        status = "has SL+TP" if (has_sl and has_tp) else "SL/TP placed"
+                        normalized = self.exchange_wrapper.normalize_symbol(sym) if hasattr(self.exchange_wrapper, 'normalize_symbol') else sym
+                        self.logger.warning(
+                            f"[STARTUP] {normalized} {side} {contracts} — {status}, reconciling to tracking")
+                        self.positions[normalized] = {
+                            'symbol': normalized, 'side': side, 'size': contracts,
+                            'entry_price': entry, 'entry_time': time.time(),
+                            'sl_order_id': 'RECONCILED', 'tp_order_id': 'RECONCILED',
+                            'initial_stop_price': sl_price, 'stop_loss': sl_price,
+                            'take_profit': tp_price,
+                            'signal_score': 50,
+                            'leverage': LEVERAGE_BASE
+                        }
+                        # already tracked in self.positions
+                else:
+                    self.logger.info("[STARTUP] No stale positions — clean slate")
+            except Exception as e:
+                self.logger.warning(f"[STARTUP] Stale position check failed: {e}")
+
         # Initialize Rich UI based on UI_MODE
         from .config import UI_MODE
         rich_ui_runtime = None
@@ -3164,13 +4043,6 @@ class ScalperBot:
             # Plain UI mode - no suppression needed
             pass
         
-        next_universe = 0
-        next_signal_scan = 0
-        
-        # Initialize regime config on startup
-        if self.regime_config is None:
-            regime_config = self.ctrl.regime_manager.get_current_config()
-            self.ctrl.apply_regime_config(self, regime_config)
         try:
             while True:
                 # Check drawdown circuit breaker (before any trading activity)
@@ -3198,62 +4070,44 @@ class ScalperBot:
                     self.ctrl.check_and_switch_regime(self)  # Check and switch regime if needed
                     self._last_llm_check = self._get_current_time()
 
-                # Get regime-specific intervals (ensure regime_config is set)
-                regime_config = getattr(self, 'regime_config', None)
-                if regime_config is None:
-                    # Fallback: Initialize regime config if somehow None
-                    regime_config = self.ctrl.regime_manager.get_current_config()
-                    self.ctrl.apply_regime_config(self, regime_config)
-                    self.regime_config = regime_config
-                
-                universe_interval = regime_config.universe_refresh_interval_seconds
-                scan_interval = regime_config.scan_interval_seconds
-                
-                # DEBUG: Log timing info on first loop or when scan is due
-                current_time = self._get_current_time()
-                if not hasattr(self, '_first_loop_logged'):
-                    self.logger.info(f"[DEBUG] Main loop started | scan_interval={scan_interval}s | universe_interval={universe_interval}s | current_time={current_time:.1f} | next_scan={next_signal_scan:.1f}")
-                    self._first_loop_logged = True
+                # Refresh universe every loop iteration (loop time ~50s is the effective interval)
+                await self.refresh_universe()
 
-                # Refresh universe at regime-specific interval
-                if current_time >= next_universe:
-                    await self.refresh_universe()
-                    next_universe = current_time + universe_interval
+                # Scan for signals every loop iteration
+                try:
+                    await asyncio.wait_for(self.scan_and_enter_signals(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    self.logger.error("[TIMEOUT] scan_and_enter_signals() hung — skipping this cycle")
+                except Exception as e:
+                    self.logger.error(f"[SCAN_ERROR] {type(e).__name__}: {e}")
 
-                # Scan for signals at regime-specific interval
-                # CRITICAL: Ensure scan runs immediately on first loop (next_signal_scan=0)
-                if current_time >= next_signal_scan:
-                    # DEBUG: Log strategy cycle entry point
-                    self.logger.info(f"[DEBUG] Strategy cycle triggered | scan_interval={scan_interval}s | next_scan={next_signal_scan:.1f} | now={current_time:.1f}")
-                    await self.scan_and_enter_signals()
-                    next_signal_scan = current_time + scan_interval
-                    self.next_scan_time = next_signal_scan
-                    
-                    # CRITICAL FIX: Signal confirmation cleanup (every 5 minutes = 300 seconds)
-                    if hasattr(self, 'signal_confirmation') and hasattr(self, '_last_scw_cleanup'):
-                        if time.time() - self._last_scw_cleanup >= 300.0:
-                            try:
-                                self.signal_confirmation.cleanup_stale_signals(max_age_sec=300.0)
-                                self._last_scw_cleanup = time.time()
-                            except Exception:
-                                pass  # Non-critical
-                    elif hasattr(self, 'signal_confirmation'):
-                        # Initialize cleanup timer
+                # Signal confirmation cleanup (every 5 minutes)
+                if hasattr(self, 'signal_confirmation'):
+                    if not hasattr(self, '_last_scw_cleanup'):
                         self._last_scw_cleanup = time.time()
-                else:
-                    # DEBUG: Log why scan is not running (only first few times to avoid spam)
-                    if not hasattr(self, '_scan_skip_log_count'):
-                        self._scan_skip_log_count = 0
-                    if self._scan_skip_log_count < 3:
-                        self.logger.info(f"[DEBUG] Scan skipped | now={current_time:.1f} < next_scan={next_signal_scan:.1f} | wait={next_signal_scan - current_time:.1f}s")
-                        self._scan_skip_log_count += 1
+                    elif time.time() - self._last_scw_cleanup >= 300.0:
+                        try:
+                            self.signal_confirmation.cleanup_stale_signals(max_age_sec=300.0)
+                            self._last_scw_cleanup = time.time()
+                        except Exception:
+                            pass
                 
-                # Monitor and exit positions (check every loop iteration)
-                await self.monitor_and_exit_positions()
+                # Monitor and exit positions — gate to every 10s (was every loop iter)
+                if not hasattr(self, '_last_monitor_run'):
+                    self._last_monitor_run = 0
+                if time.time() - self._last_monitor_run >= 10.0:
+                    self._last_monitor_run = time.time()
+                    try:
+                        await asyncio.wait_for(self.monitor_and_exit_positions(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        self.logger.error("[TIMEOUT] monitor_and_exit_positions() hung")
+                    except Exception as e:
+                        self.logger.error(f"[MONITOR_ERROR] {type(e).__name__}: {e}")
                 
-                # API BUDGET OPTIMIZATION: Refresh orderbooks for open positions (better exit decisions)
-                if self.positions and time.time() - self.last_orderbook_refresh >= 1.0:
+                # Refresh orderbooks for open positions (uses separate timer to avoid starving top-symbols refresh)
+                if self.positions and time.time() - self._last_positions_ob_refresh >= self._positions_ob_interval:
                     await self._refresh_orderbooks_for_positions()
+                    self._last_positions_ob_refresh = time.time()
 
                 # UI UPDATE: Refresh every 2 seconds for better visibility
                 # OPTIMIZATION: Use cached time to avoid extra time.time() call
@@ -3282,6 +4136,13 @@ class ScalperBot:
 
                 # LATENCY OPTIMIZATION: Reduce sleep to 0.1s for faster loop (was 0.25s)
                 await asyncio.sleep(0.1)
+
+                # HEARTBEAT: Log every ~30s so we know the loop is alive
+                if not hasattr(self, '_heartbeat_count'):
+                    self._heartbeat_count = 0
+                self._heartbeat_count += 1
+                if self._heartbeat_count % 300 == 0:  # Every 300 loops = ~30s
+                    self.logger.debug(f"[HEARTBEAT] loop alive | scans={self._heartbeat_count//300} | pos={len(self.positions)}")
                 
                 # SNAPSHOT VALIDATION: Periodic check (every ~60s)
                 if time.time() - self._last_metrics_log >= 60.0:

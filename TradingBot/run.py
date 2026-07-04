@@ -9,6 +9,8 @@ import asyncio
 import sys
 import signal
 import os
+import time
+import subprocess
 import logging
 from pathlib import Path
 
@@ -107,6 +109,14 @@ def remove_lock_file(lock_file: Path = Path("run.lock")):
     except Exception:
         pass  # Ignore errors during cleanup
 
+def remove_pid_file(pid_file: Path = Path("bot.pid")):
+    """Remove PID file on clean shutdown."""
+    try:
+        if pid_file.exists():
+            pid_file.unlink()
+    except Exception:
+        pass
+
 
 async def main():
     """
@@ -114,9 +124,12 @@ async def main():
     All output goes to file logger, NOT console (to preserve UI).
     """
     lock_file = Path("run.lock")
+    pid_file = Path("bot.pid")
+    # Write PID so restart scripts can target only this process
+    pid_file.write_text(str(os.getpid()))
     logger = None
     bot = None
-    
+
     # STARTUP DIAGNOSTICS (console output OK before UI starts, but route to logger for consistency)
     # Get logger early (before UI starts) - console output allowed here
     try:
@@ -139,15 +152,32 @@ async def main():
     # Single-instance guard
     logger.info("[STARTUP] Checking for existing instance...")
     is_running, reason = check_single_instance(lock_file)
+    force = os.getenv("FORCE_START", "0") in ("1", "true", "TRUE")
+
     if is_running:
-        logger.error(f"[STARTUP] ✗ Another instance is already running: {reason}")
-        logger.error("[STARTUP] If this is incorrect, delete run.lock and try again")
-        sys.exit(1)
-    
+        if force:
+            # Kill old process and take over
+            try:
+                with open(lock_file, 'r') as f:
+                    old_pid = int(f.read().strip())
+                if os.name == 'nt':
+                    subprocess.run(["taskkill", "/F", "/PID", str(old_pid)], capture_output=True)
+                else:
+                    os.kill(old_pid, 9)  # SIGKILL
+                logger.warning(f"[STARTUP] Killed old instance PID {old_pid}")
+                time.sleep(2)
+                remove_lock_file(lock_file)
+            except Exception as e:
+                logger.error(f"[STARTUP] Failed to kill old instance: {e}")
+                sys.exit(1)
+        else:
+            logger.error(f"[STARTUP] ✗ Another instance is already running: {reason}")
+            logger.error("[STARTUP] Set FORCE_START=1 to override")
+            sys.exit(1)
+
     # Handle stale lock files
     if reason.startswith("stale"):
-        # Allow override via environment variable
-        if os.getenv("FORCE_START", "0") not in ("1", "true", "TRUE"):
+        if not force:
             logger.warning(f"[STARTUP] ⚠ Stale lock file detected ({reason})")
             logger.warning("[STARTUP] Set FORCE_START=1 to override, or delete run.lock manually")
             sys.exit(1)
@@ -241,9 +271,10 @@ async def main():
         raise  # Re-raise to be caught by outer handler
     
     finally:
-        # CRITICAL: Always clean up lock file and shutdown logging
+        # CRITICAL: Always clean up lock file, PID file, and shutdown logging
         remove_lock_file(lock_file)
-        
+        remove_pid_file()
+
         # Shutdown logging to flush and close all handlers
         logging.shutdown()
 
@@ -261,6 +292,7 @@ if __name__ == "__main__":
             pass  # Silently exit
         finally:
             remove_lock_file(lock_file)
+            remove_pid_file()
             logging.shutdown()
         sys.exit(0)
     except Exception as e:
@@ -273,5 +305,6 @@ if __name__ == "__main__":
             pass  # Silently exit
         finally:
             remove_lock_file(lock_file)
+            remove_pid_file()
             logging.shutdown()
         sys.exit(1)
