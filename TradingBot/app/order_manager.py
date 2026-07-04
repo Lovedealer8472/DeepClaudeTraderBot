@@ -28,9 +28,11 @@ class OrderManager:
     """Manages order execution with smart routing."""
     
     def __init__(self, exchange=None):
+        from .logger import get_logger
         self.exchange = exchange
         self.order_history = []
         self.leverage_cache = {}  # Cache for leverage settings
+        self.logger = get_logger("OrderManager")
     
     async def enter_position(
         self,

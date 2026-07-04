@@ -481,8 +481,14 @@ class ExitPipeline:
                 verified_gone = False
                 try:
                     import asyncio
-                    await asyncio.sleep(0.5)
-                    pos_check = await exchange.fetch_positions([symbol])
+                    # Get exchange from bot_instance — never use bare 'exchange'
+                    _ex = bot_instance.exchange_wrapper if bot_instance else None
+                    if _ex is None:
+                        self.logger.error(f"[GHOST_EXIT] {symbol} no exchange — assuming position gone")
+                        verified_gone = True
+                    else:
+                        await asyncio.sleep(0.5)
+                        pos_check = await _ex.fetch_positions([symbol])
                     still_open = any(
                         float(p.get('contracts', 0)) > 0
                         for p in (pos_check if isinstance(pos_check, list) else [pos_check])
@@ -500,13 +506,13 @@ class ExitPipeline:
                             close_side = 'sell' if pos_details.get('side', 'long') == 'long' else 'buy'
                             qty = abs(float(pos_details.get('size', 0)))
                             if qty > 0:
-                                await exchange.create_order(
+                                await _ex.create_order(
                                     symbol, 'market', close_side, qty, None,
                                     {'reduceOnly': 'true'}
                                 )
                                 # Check again after market close
                                 await asyncio.sleep(1)
-                                pos_check2 = await exchange.fetch_positions([symbol])
+                                pos_check2 = await _ex.fetch_positions([symbol])
                                 still_open2 = any(
                                     float(p.get('contracts', 0)) > 0
                                     for p in (pos_check2 if isinstance(pos_check2, list) else [pos_check2])
