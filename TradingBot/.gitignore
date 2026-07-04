@@ -78,3 +78,32 @@ run_bot_30min.py
 # Temporary log files
 *.txt
 bot_run_log.txt
+
+# Project cruft — not needed in repo
+.cursor/
+devtools/
+diagnostics/
+reports/
+notes/
+app.zip
+run.lock
+*.plan.md
+decisions_*.jsonl
+CONSOLE_OUTPUT_ELIMINATION.md
+FILTER_RELAXATION.md
+MAX_OPEN_POSITIONS_FIX_DIFF.md
+SIGNAL_SUMMARY_AGGREGATION.md
+UI_V2_STATIC_UPGRADE.md
+UI_ZERO_OUTPUT_QUICKREF.md
+UNICORN_PROTOCOL.md
+UPGRADE_PLAN.md
+notes_unirabbit.md
+checkin.sh
+close_all.py
+dashboard.py
+grid_bot.py
+watch.py
+strategy_manager.py
+replay_runner.py
+analyze_dry_exits.py
+pytest.ini
