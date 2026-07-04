@@ -49,22 +49,26 @@ def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
         if _is_cache_valid(cached_time):
             return cached_value
     
-    # Calculate price changes
-    # OPTIMIZATION: Use generator for deltas (more memory efficient)
+    # Wilder's smoothing: first value is SMA, then exponential decay
+    # RSI = 100 - (100 / (1 + avg_gain/avg_loss))
     deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    
-    # Separate gains and losses
-    gains = [d if d > 0 else 0.0 for d in deltas]
-    losses = [-d if d < 0 else 0.0 for d in deltas]
-    
-    # Calculate average gain and loss over period
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    
+
+    # Wilder's initial values: SMA over first `period` deltas
+    gains = [d if d > 0 else 0.0 for d in deltas[:period]]
+    losses = [-d if d < 0 else 0.0 for d in deltas[:period]]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    # Wilder's smoothing for remaining deltas
+    for i in range(period, len(deltas)):
+        g = deltas[i] if deltas[i] > 0 else 0.0
+        l = -deltas[i] if deltas[i] < 0 else 0.0
+        avg_gain = (avg_gain * (period - 1) + g) / period
+        avg_loss = (avg_loss * (period - 1) + l) / period
+
     if avg_loss == 0:
-        rsi = 100.0  # All gains, no losses
+        rsi = 100.0
     else:
-        # Calculate RS and RSI
         rs = avg_gain / avg_loss
         rsi = 100.0 - (100.0 / (1.0 + rs))
     
@@ -145,10 +149,12 @@ def calculate_atr(highs: List[float], lows: List[float], closes: List[float], pe
     
     if len(true_ranges) < period:
         return None
-    
-    # Calculate ATR as SMA of True Ranges
-    atr = sum(true_ranges[-period:]) / period
-    
+
+    # Wilder's ATR smoothing: first value SMA, then exponential decay
+    atr = sum(true_ranges[:period]) / period
+    for i in range(period, len(true_ranges)):
+        atr = (atr * (period - 1) + true_ranges[i]) / period
+
     return atr
 
 
@@ -228,9 +234,34 @@ def calculate_adx(highs: List[float], lows: List[float], closes: List[float], pe
 
     dx = abs(plus_di - minus_di) / di_sum * 100.0
 
-    # ADX is a smoothed average of DX — for simplicity we return DX directly
-    # (a single DX value is a good enough proxy for "is the market trending right now")
-    return dx
+    # Compute full Wilder-smoothed ADX from the DX series
+    # ADX = smoothed average of DX values using Wilder's method
+    dx_values = []
+    for i in range(period, len(plus_dm) + 1):
+        atr_i = sum(tr_values[:period]) / period
+        spdm_i = sum(plus_dm[:period]) / period
+        smdm_i = sum(minus_dm[:period]) / period
+        alpha = 1.0 / period
+        for j in range(period, min(i, len(tr_values))):
+            atr_i = (tr_values[j] * alpha) + (atr_i * (1 - alpha))
+            spdm_i = (plus_dm[j] * alpha) + (spdm_i * (1 - alpha))
+            smdm_i = (minus_dm[j] * alpha) + (smdm_i * (1 - alpha))
+        if atr_i > 0:
+            pdi = (spdm_i / atr_i) * 100.0
+            mdi = (smdm_i / atr_i) * 100.0
+            di_s = pdi + mdi
+            dx_values.append(abs(pdi - mdi) / di_s * 100.0 if di_s > 0 else 0.0)
+        else:
+            dx_values.append(0.0)
+
+    if not dx_values:
+        return None
+
+    # Wilder smooth the DX values to get final ADX
+    adx = sum(dx_values[:period]) / period
+    for i in range(period, len(dx_values)):
+        adx = (adx * (period - 1) + dx_values[i]) / period
+    return adx
 
 
 def calculate_efficiency_ratio(prices: List[float], period: int = 20) -> Optional[float]:
