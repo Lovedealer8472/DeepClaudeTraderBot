@@ -238,6 +238,13 @@ class ScalperBot:
     async def cleanup(self):
         """Cleanup resources."""
         try:
+            # Close lightweight exchange (separate connection pool)
+            if hasattr(self, '_lightweight_ex') and self._lightweight_ex is not None:
+                try:
+                    await self._lightweight_ex.close()
+                except Exception:
+                    pass
+                self._lightweight_ex = None
             # Cleanup: Close storage connection
             if hasattr(self, 'fast_storage'):
                 self.fast_storage.close()

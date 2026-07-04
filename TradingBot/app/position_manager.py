@@ -227,7 +227,7 @@ class PositionManager:
             rpa_max_risk_usd = equity * TOTAL_RISK_BUDGET * RPA_MAX_RISK_BUDGET_PCT
             # Ensure it doesn't exceed MAX_RISK_PER_TRADE
             max_risk_usd = min(rpa_max_risk_usd, equity * MAX_RISK_PER_TRADE)
-            max_size_by_risk = (max_risk_usd * actual_leverage) / (entry_price * stop_distance_pct) if stop_distance_pct > 0 else float('inf')
+            max_size_by_risk = max_risk_usd / (entry_price * stop_distance_pct) if stop_distance_pct > 0 else float('inf')  # base contracts — leverage not a factor
             max_position_by_capital = min(max_position_by_capital, max_size_by_risk)
         
         position_size = min(position_size, max_position_by_capital)
@@ -238,10 +238,8 @@ class PositionManager:
         position_size = max(position_size, min_size)
         
         # Recalculate actual risk after capping (in case size was reduced)
-        # CRITICAL: Risk is calculated on BASE size (position_size / leverage)
-        # position_size here is LEVERAGED SIZE, so divide by leverage to get base
-        actual_base_size = position_size / actual_leverage
-        actual_notional_risk = actual_base_size * price_risk
+        # INVARIANT: position_size is base contracts. Risk is base_contracts × price_risk.
+        actual_notional_risk = position_size * price_risk
         actual_risk_fraction = (actual_notional_risk / equity) if equity > 0 else 0.0
         
         # Return LEVERAGED SIZE (what exchange sees) and risk fraction
@@ -1123,8 +1121,8 @@ class PositionManager:
         
         entry_price = position.get('entry_price', 0)
         stop_loss = position.get('stop_loss', 0)
-        position_size = position.get('size', 0)  # This is LEVERAGED size
-        leverage = position.get('leverage', 1)  # Get leverage from position
+        position_size = position.get('size', 0)  # This is BASE contracts
+        leverage = position.get('leverage', 1)  # Informational only — doesn't affect contract count
         side = position.get('side', 'long').lower()
         
         if not entry_price or not stop_loss or not position_size:
@@ -1141,12 +1139,10 @@ class PositionManager:
             price_risk = stop_loss - entry_price
         
         # CRITICAL: Position size stored is LEVERAGED SIZE
-        # Base size = leveraged size / leverage (actual capital exposure)
-        base_size = abs(position_size) / leverage if leverage > 0 else abs(position_size)
+        # INVARIANT: position_size is already base contracts
         
         # Notional risk (quote currency lost if SL hit)
-        # Risk is independent of leverage - it's the price movement * base size
-        notional_risk = price_risk * base_size
+        notional_risk = price_risk * abs(position_size)  # base_contracts × price_risk
         
         # Risk as fraction of equity
         return notional_risk / equity
@@ -1405,19 +1401,19 @@ class PositionManager:
         position_size_usd = equity * (size_pct / 100.0)
         position_size = position_size_usd / entry_price
         
-        # Apply leverage
-        position_size = position_size * leverage
+        # position_size is already base contracts — leverage doesn't change contract count
+        # Leverage only affects margin usage, not PnL
         
         # Risk cap: Ensure max risk at stop loss doesn't exceed MAX_RISK_PER_TRADE_PCT
         max_risk_usd = equity * (MAX_RISK_PER_TRADE_PCT / 100.0)
-        risk_at_stop = position_size * entry_price * stop_distance_pct / leverage
+        risk_at_stop = position_size * entry_price * stop_distance_pct  # base contracts × price risk
         if risk_at_stop > max_risk_usd:
             # Reduce position size to meet risk cap
             position_size = (max_risk_usd * leverage) / (entry_price * stop_distance_pct)
         
         # Apply final caps
         max_capital = equity * MAX_CAPITAL_PER_POS
-        max_position_by_capital = (max_capital * leverage) / entry_price
+        max_position_by_capital = max_capital / entry_price  # base contracts
         
         position_size = min(position_size, max_position_by_capital)
         position_size = min(position_size, MAX_POSITION_SIZE / entry_price)
