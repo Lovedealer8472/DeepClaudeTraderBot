@@ -122,6 +122,10 @@ CORRELATION_THRESHOLD = env("CORRELATION_THRESHOLD", "2", int)  # Number of corr
 CORRELATION_BLOCK_THRESHOLD = env("CORRELATION_BLOCK_THRESHOLD", "0.90", float)  # Block entry if correlation > 0.90 with any open position (relaxed from 0.85)
 STREAK_THRESHOLD = env("STREAK_THRESHOLD", "3", int)  # Number of consecutive losses before penalty applies
 TREND_ALIGNMENT_REQUIRED = env("TREND_ALIGNMENT_REQUIRED", "0") in ("1","true","TRUE")  # Require 5m and 15m trend alignment with trade direction (disabled by default - too restrictive)
+MOMENTUM_15M_ENABLED = env("MOMENTUM_15M_ENABLED", "1") in ("1","true","TRUE")  # Block longs on declining 15m momentum, shorts on rising
+MOMENTUM_15M_THRESHOLD_PCT = env("MOMENTUM_15M_THRESHOLD_PCT", "-1.0", float)  # Reject long if 15m change below this %, short if above negative
+BTC_CHOP_THRESHOLD = env("BTC_CHOP_THRESHOLD", "0.5", float)  # If |BTC 24h change| < 0.5%, market is choppy — stand down
+STOP_JITTER_PCT = env("STOP_JITTER_PCT", "0.15", float)  # Randomize stops ±15% to avoid stop-hunts
 MAX_CAPITAL_PER_POS = env("MAX_CAPITAL_PER_POS","0.15", float)  # Max 15% of account per position - reduced for live trading safety
 
 # Score-Aware Replacement Logic
@@ -165,8 +169,8 @@ MIN_VOLUME_24H     = env("MIN_VOLUME_24H","1000000", float)  # Minimum $1M 24h v
 MAX_LATENCY_MS     = env("MAX_LATENCY_MS","50", int)  # Ultra-low latency: 50ms (cached data only, no API calls)
 MIN_SIGNAL_STRENGTH = env("MIN_SIGNAL_STRENGTH","0.60", float)  # Minimum signal strength (0-1 scale) - relaxed for Binance Futures
 # PURE_SCALPER MODE: Static score thresholds (no dynamic adjustments)
-MIN_SIGNAL_SCORE = env("MIN_SIGNAL_SCORE","71", int)  # Main entry gate threshold (static in PURE_SCALPER mode)
-HARD_MIN_SCORE = env("HARD_MIN_SCORE", "68", int)  # Hard floor (auto reject if below) - should be a couple points below MIN_SIGNAL_SCORE
+MIN_SIGNAL_SCORE = env("MIN_SIGNAL_SCORE","60", int)  # Main entry gate threshold (static in PURE_SCALPER mode)
+HARD_MIN_SCORE = env("HARD_MIN_SCORE", "55", int)  # Hard floor (auto reject if below) - should be a couple points below MIN_SIGNAL_SCORE
 SIGNAL_PERCENTILE_THRESHOLD = env("SIGNAL_PERCENTILE_THRESHOLD","0.0", float)  # LIVE MODE: Disabled (0.0 = no percentile filtering) - allows more signals
 USE_SIGNAL_PERCENTILE_FILTER = env("USE_SIGNAL_PERCENTILE_FILTER", "0") in ("1","true","TRUE")  # PURE_SCALPER: Disabled by default - percentile filter not used
 USE_THREE_STAGE_FILTER = env("USE_THREE_STAGE_FILTER", "1") in ("1","true","TRUE")  # PURE_SCALPER: Enabled by default but softened (microstructure only rejects garbage)
@@ -254,7 +258,7 @@ TRAILING_STOP_ACTIVATION_PCT = env("TRAILING_STOP_ACTIVATION_PCT", "0.7", float)
 TRAILING_STOP_PCT = env("TRAILING_STOP_PCT", "50.0", float) / 100.0  # Trail stop to 50% of profit
 
 # ATR-Based Trailing Stops (Phase 1: External Review Implementation)
-USE_ATR_TRAILING_STOP = env("USE_ATR_TRAILING_STOP", "1") in ("1","true","TRUE")  # Enable ATR-based trailing stops
+USE_ATR_TRAILING_STOP = env("USE_ATR_TRAILING_STOP", "0") in ("1","true","TRUE")  # Disabled — use scalper_trailing instead
 ATR_TRAILING_MULTIPLIER = env("ATR_TRAILING_MULTIPLIER", "2.0", float)  # Default 2× ATR behind peak
 ATR_TRAILING_MIN_DISTANCE_PCT = env("ATR_TRAILING_MIN_DISTANCE_PCT", "0.5", float) / 100.0  # Minimum 0.5% distance
 ATR_TRAILING_SCALPING_MULTIPLIER = env("ATR_TRAILING_SCALPING_MULTIPLIER", "1.5", float)  # Tighter for scalping
@@ -262,8 +266,8 @@ ATR_TRAILING_DAY_MULTIPLIER = env("ATR_TRAILING_DAY_MULTIPLIER", "2.0", float)  
 ATR_TRAILING_SWING_MULTIPLIER = env("ATR_TRAILING_SWING_MULTIPLIER", "2.5", float)  # Wider for swing trading
 
 # R-Based Trailing Stop Engine (canonical trailing)
-USE_TRAILING_ENGINE = env("USE_TRAILING_ENGINE", "1") in ("1", "true", "TRUE")
-USE_NEW_TRAILING_ENGINE = env("USE_NEW_TRAILING_ENGINE", "1") in ("1", "true", "TRUE")
+USE_TRAILING_ENGINE = env("USE_TRAILING_ENGINE", "0") in ("1", "true", "TRUE")  # Disabled — use scalper_trailing instead
+USE_NEW_TRAILING_ENGINE = env("USE_NEW_TRAILING_ENGINE", "0") in ("1", "true", "TRUE")  # Disabled — use scalper_trailing instead
 TRAIL_ENGINE_START_BUFFER_R = env("TRAIL_ENGINE_START_BUFFER_R", "0.5", float)  # No trailing before 0.5R
 TRAIL_ENGINE_PARTIAL_1_R = env("TRAIL_ENGINE_PARTIAL_1_R", "1.0", float)  # First partial at +1R
 TRAIL_ENGINE_PARTIAL_1_SIZE = env("TRAIL_ENGINE_PARTIAL_1_SIZE", "0.25", float)  # Default 25% clip
@@ -344,13 +348,13 @@ LOSS_STREAK_DECAY_SECONDS = env("LOSS_STREAK_DECAY_SECONDS", "900", int) # Auto-
 HIGH_SCORE_BYPASS = env("HIGH_SCORE_BYPASS", "90.0", float)              # Unicorn threshold for bypass
 
 # Break-Even Rescue Protocol (BERP)
-BERP_ENABLED = env("BERP_ENABLED", "1") in ("1","true","TRUE")  # Enable Break-Even Rescue Protocol
+BERP_ENABLED = env("BERP_ENABLED", "0") in ("1","true","TRUE")  # Disabled — exit system simplified
 BERP_TRIGGER_AGE_SEC = env("BERP_TRIGGER_AGE_SEC", "3600", int)  # Trigger rescue at 60 minutes (3600s)
 BERP_TRIGGER_PNL_THRESHOLD = env("BERP_TRIGGER_PNL_THRESHOLD", "0.3", float)  # Trigger if PnL < +0.3% (soft noise margin)
 BERP_RESCUE_DURATION_SEC = env("BERP_RESCUE_DURATION_SEC", "3600", int)  # Rescue duration: 60 minutes (3600s)
 
 # R-Based Exit Engine (Score-Aware Exit Management)
-USE_R_BASED_EXITS = env("USE_R_BASED_EXITS", "1") in ("1","true","TRUE")  # Enable R-based exit engine
+USE_R_BASED_EXITS = env("USE_R_BASED_EXITS", "0") in ("1","true","TRUE")  # Disabled — use scalper_trailing + basic SL/TP instead
 R_EXIT_SCALP_SCORE_MIN = env("R_EXIT_SCALP_SCORE_MIN", "60", int)  # Minimum score for scalp profile (60-69)
 R_EXIT_SCALP_SCORE_MAX = env("R_EXIT_SCALP_SCORE_MAX", "69", int)  # Maximum score for scalp profile
 R_EXIT_STANDARD_SCORE_MIN = env("R_EXIT_STANDARD_SCORE_MIN", "70", int)  # Minimum score for standard profile (70-85)
@@ -388,6 +392,24 @@ R_RUNNER_BOREDOM_RANGE = env("R_RUNNER_BOREDOM_RANGE", "0.3", float)  # Exit if 
 # Each scan cycle counts as 1 bar
 R_BAR_SCAN_CYCLE_SEC = env("R_BAR_SCAN_CYCLE_SEC", "30", int)  # Approximate scan cycle time (30 seconds)
 
+# ADX Trend Gate — prevents entries in trending markets (scalper grid only works in chop)
+ADX_TREND_GATE_ENABLED = env("ADX_TREND_GATE_ENABLED", "1") in ("1","true","TRUE")  # Block new entries when ADX > threshold
+ADX_TREND_GATE_THRESHOLD = env("ADX_TREND_GATE_THRESHOLD", "25", float)  # ADX > 25 = trending, block entries
+
+# Efficiency Ratio Gate — blocks entries when price is too directional (Kaufman, 1995)
+# ER > 0.35 = strong trend (dangerous for mean-reversion). ER < 0.20 = pure noise.
+# Mean-reversion scalping works best at ER 0.20–0.35 (gentle chop).
+ER_FILTER_ENABLED = env("ER_FILTER_ENABLED", "1") in ("1","true","TRUE")  # Enable ER regime filter
+ER_FILTER_MAX_THRESHOLD = env("ER_FILTER_MAX_THRESHOLD", "0.35", float)  # ER > 0.35 = too directional, block
+ER_FILTER_MIN_THRESHOLD = env("ER_FILTER_MIN_THRESHOLD", "0.15", float)  # ER < 0.15 = too noisy, block
+
+# Volatility-targeted position sizing — scale size down when volatility is elevated
+VOL_TARGET_ENABLED = env("VOL_TARGET_ENABLED", "1") in ("1","true","TRUE")  # Enable vol-targeted sizing
+VOL_TARGET_NORMAL_ATR = env("VOL_TARGET_NORMAL_ATR", "1.5", float)  # ATR% below this = normal vol, full size
+VOL_TARGET_ELEVATED_ATR = env("VOL_TARGET_ELEVATED_ATR", "2.5", float)  # ATR% above this = high vol, 50% size
+VOL_TARGET_SIZE_MULT_ELEVATED = env("VOL_TARGET_SIZE_MULT_ELEVATED", "0.75", float)  # 75% size at elevated vol
+VOL_TARGET_SIZE_MULT_HIGH = env("VOL_TARGET_SIZE_MULT_HIGH", "0.50", float)  # 50% size at high vol
+
 # Signal Confirmation Window (SCW)
 USE_SIGNAL_CONFIRMATION = env("USE_SIGNAL_CONFIRMATION", "0") in ("1","true","TRUE")  # Disabled for calibration run
 SCW_UNICORN_CONFIRM = env("SCW_UNICORN_CONFIRM", "0", int)  # Unicorn (90+): 0 bars confirmation
@@ -406,12 +428,12 @@ RPA_MIN_SIZE_USD = env("RPA_MIN_SIZE_USD", "5", float)  # Minimum position size 
 RPA_MAX_RISK_BUDGET_PCT = env("RPA_MAX_RISK_BUDGET_PCT", "0.5", float)  # Max position = 50% of total risk budget
 
 # Score-Weighted Trailing Algorithm (SWTA)
-USE_SWTA = env("USE_SWTA", "1") in ("1","true","TRUE")  # Enable SWTA
+USE_SWTA = env("USE_SWTA", "0") in ("1","true","TRUE")  # Disabled — exit system simplified
 SWTA_BASE_MULTIPLIER = env("SWTA_BASE_MULTIPLIER", "1.6", float)  # More responsive trailing (was 2.0)
 SWTA_START_R = env("SWTA_START_R", "1.5", float)  # Start trailing at 1.5R
 
 # Multi-Stage Exit Framework (MSX)
-USE_MSX = env("USE_MSX", "1") in ("1","true","TRUE")  # Enable MSX framework
+USE_MSX = env("USE_MSX", "0") in ("1","true","TRUE")  # Disabled — exit system simplified
 # ──────────────────────────────────────────────
 # MSX EXIT ENGINE SETTINGS
 # Stage-1 = initial validation to avoid instant-regret fills.

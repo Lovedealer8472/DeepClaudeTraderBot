@@ -81,11 +81,11 @@ REGIME_CONFIGS: Dict[TradingRegime, RegimeConfig] = {
         max_concurrent_positions_min=3,
         max_concurrent_positions_max=12,
         # Risk management
-        stop_loss_atr_multiplier=1.5,  # 1.8% stop (1.5x ATR of 1.2%)
-        take_profit_atr_multiplier=2.5,  # 3.0% target (2.5x ATR)
+        stop_loss_atr_multiplier=2.0,
+        take_profit_atr_multiplier=1.2,  # Tight TP for fast capture — trail handles bigger moves
         min_stop_distance_pct=0.5,
-        trailing_stop_activation_pct=1.0,
-        trailing_stop_pct=0.5,
+        trailing_stop_activation_pct=0.4,  # Activate at 0.4% — protect winners fast, losers hit stop
+        trailing_stop_pct=0.2,  # Trail 20% — lock in 80% of peak
         # Exit conditions
         wide_spread_exit_threshold_bps=50.0,
         early_stop_loss_pct=0.8,
@@ -116,9 +116,9 @@ REGIME_CONFIGS: Dict[TradingRegime, RegimeConfig] = {
         max_concurrent_positions_max=8,
         # Risk management
         stop_loss_atr_multiplier=2.0,  # 2.4% stop (2.0x ATR)
-        take_profit_atr_multiplier=3.5,  # 4.2% target (3.5x ATR)
+        take_profit_atr_multiplier=2.0,  # 4.2% target (3.5x ATR)
         min_stop_distance_pct=1.0,
-        trailing_stop_activation_pct=1.5,
+        trailing_stop_activation_pct=2.0,  # Trailing activates at 2% profit
         trailing_stop_pct=0.6,
         # Exit conditions
         wide_spread_exit_threshold_bps=70.0,
@@ -152,7 +152,7 @@ REGIME_CONFIGS: Dict[TradingRegime, RegimeConfig] = {
         stop_loss_atr_multiplier=2.5,  # 3.0% stop (2.5x ATR)
         take_profit_atr_multiplier=5.0,  # 6.0% target (5.0x ATR)
         min_stop_distance_pct=1.5,
-        trailing_stop_activation_pct=2.0,
+        trailing_stop_activation_pct=2.0,  # Trailing activates at 2% profit
         trailing_stop_pct=0.7,
         # Exit conditions
         wide_spread_exit_threshold_bps=100.0,
@@ -171,7 +171,7 @@ class RegimeManager:
     """Manages trading regime selection and configuration."""
     
     def __init__(self):
-        self.current_regime: TradingRegime = TradingRegime.SCALPING
+        self.current_regime: TradingRegime = TradingRegime.DAY_TRADING  # Shifted from SCALPING — Jul 3
         self.regime_since: float = 0.0
         self.regime_history: list = []  # Track regime changes
         
