@@ -3376,6 +3376,8 @@ class ScalperBot:
 
             # Process all queued exits
             processed = await self.exit_pipeline.process_exits(bot_instance=self)
+                # Circuit breaker: track all exits from pipeline
+                if processed > 0 and not hasattr(self, "_recent_exit_pnls"): self._recent_exit_pnls = []
             if processed > 0:
                 self.logger.debug(f"ExitPipeline processed {processed} exits")
         else:

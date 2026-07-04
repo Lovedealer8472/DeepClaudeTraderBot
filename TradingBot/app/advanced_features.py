@@ -198,7 +198,7 @@ def compute_extension_features(ltf_df: pd.DataFrame, current_price: float, htf_e
     typical_price = (high + low + close) / 3.0
     if 'volume' in ltf_df.columns:
         volume = ltf_df['volume'].values
-        vwap = np.sum(typical_price * volume) / np.sum(volume)
+        vol_sum = np.sum(volume); vwap = np.sum(typical_price * volume) / vol_sum if vol_sum > 0 else typical_price.mean()
     else:
         vwap = np.mean(typical_price)
     
@@ -210,13 +210,13 @@ def compute_extension_features(ltf_df: pd.DataFrame, current_price: float, htf_e
     sma_close_val = sma_close[-1] if len(sma_close) > 0 else None
     
     # Distances
-    dist_from_ema20 = (current_price - ema20_val) / ema20_val if ema20_val > 0 else 0.0
-    dist_from_ema50 = (current_price - ema50_val) / ema50_val if ema50_val > 0 else 0.0
-    dist_from_htf_ema50 = (current_price - htf_ema50) / htf_ema50 if htf_ema50 and htf_ema50 > 0 else 0.0
+    dist_from_ema20 = (current_price - ema20_val) / ema20_val if abs(ema20_val) > 1e-9 else 0.0
+    dist_from_ema50 = (current_price - ema50_val) / ema50_val if abs(ema50_val) > 1e-9 else 0.0
+    dist_from_htf_ema50 = (current_price - htf_ema50) / htf_ema50 if htf_ema50 is not None and abs(htf_ema50) > 1e-9 else 0.0
     dist_from_vwap = (current_price - vwap) / vwap if vwap > 0 else 0.0
     
     # ATR z-score
-    if atr_val and atr_val > 0 and sma_close_val:
+    if atr_val is not None and atr_val > 0 and sma_close_val is not None and sma_close_val != 0:
         atr_zscore = (current_price - sma_close_val) / atr_val
     else:
         atr_zscore = 0.0
@@ -254,7 +254,7 @@ def compute_momentum_features(ltf_df: pd.DataFrame) -> Dict[str, Any]:
     macd_hist_val = macd_hist[-1] if len(macd_hist) > 0 else None
     
     # Momentum (ROC)
-    momentum = ((close[-1] - close[-6]) / close[-6]) if len(close) >= 6 else 0.0
+    momentum = ((close[-1] - close[-6]) / close[-6]) if (len(close) >= 6 and close[-6] != 0) else 0.0
     
     # Divergence detection (simplified: check recent highs/lows vs RSI/MACD)
     bearish_divergence = False

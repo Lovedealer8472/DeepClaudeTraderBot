@@ -304,7 +304,8 @@ class ExitPipeline:
         
         # Add to queue (sorted by priority)
         self._exit_queue.append(request)
-        self._exit_queue.sort(key=lambda x: x.priority, reverse=True)
+        # Use bisect.insort for O(log n) instead of O(n log n) sort
+        import bisect; bisect.insort(self._exit_queue, request, key=lambda x: -x.priority)
         
         return True
     
@@ -330,7 +331,7 @@ class ExitPipeline:
             symbols_processed_this_batch = set()
             
             while self._exit_queue:
-                request = self._exit_queue.pop(0)
+                request = self._exit_queue.pop(0)  # Note: O(n) — consider collections.deque for O(1)
                 
                 # Skip if we've already processed an exit for this symbol in this batch
                 # (prevents duplicate exits when multiple requests are queued)

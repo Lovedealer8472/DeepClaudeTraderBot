@@ -124,7 +124,7 @@ class OrderManager:
                     pass  # Return the failure — bot will cooldown this symbol and move on
             
             # Record order (non-blocking)
-            self.order_history.append({
+            if len(self.order_history) > 1000: self.order_history = self.order_history[-500:]; self.order_history.append({
                 'symbol': symbol,
                 'side': side,
                 'size': size,
@@ -198,7 +198,7 @@ class OrderManager:
                         pass  # Non-critical background task
         
         # Run in background (fire and forget)
-        asyncio.create_task(_pre_set())
+        task = asyncio.create_task(_pre_set()); self._background_tasks = getattr(self, "_background_tasks", []); self._background_tasks.append(task)
     
     async def _place_market_order_fast(
         self,
