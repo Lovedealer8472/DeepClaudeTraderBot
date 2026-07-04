@@ -111,6 +111,7 @@ def build_close_position_tp(
 def build_trailing_stop(
     symbol: str,
     side: str,
+    quantity: float,
     callback_rate: float,   # 0.1 to 10.0 (percentage)
     activate_price: Optional[float] = None,
     working_type: str = "MARK_PRICE",
@@ -120,6 +121,8 @@ def build_trailing_stop(
     Build a TRAILING_STOP_MARKET algo order payload.
     Server-side trailing — no bot intervention needed after placement.
     callback_rate: 0.1 = 0.1%, 1.0 = 1.0%, max 10.0.
+    IMPORTANT: closePosition NOT supported on TRAILING_STOP_MARKET (returns -4136).
+    Must use quantity + reduceOnly instead.
     """
     if client_algo_id is None:
         client_algo_id = f"trail_{symbol.replace('/', '')}_{uuid.uuid4().hex[:8]}"
@@ -130,7 +133,8 @@ def build_trailing_stop(
         "type": "TRAILING_STOP_MARKET",
         "callbackRate": round(callback_rate, 2),
         "workingType": working_type,
-        "closePosition": "true",
+        "quantity": str(quantity),
+        "reduceOnly": "true",
         "newClientAlgoId": client_algo_id,
     }
     if activate_price is not None:
@@ -143,15 +147,32 @@ def build_trailing_stop(
 # ═══════════════════════════════════════════
 
 async def place_algo_order(exchange, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Place an algo order via POST /fapi/v1/algoOrder. Returns response dict or None."""
+    """Place a closePosition algo order via CCXT (auto-routes to /fapi/v1/algoOrder).
+    CCXT ≥4.5.27 handles routing when stopPrice/triggerPrice is present.
+    Call signature: exchange.create_order(symbol, type, side, amount, price, params)
+    """
     try:
-        return await exchange.create_order(**payload)
+        symbol = payload["symbol"]
+        order_type = payload["type"]
+        side = payload["side"]
+        # closePosition orders have no quantity — pass 0
+        params = {
+            "stopPrice": payload["triggerPrice"],
+            "closePosition": True,
+            "workingType": payload.get("workingType", "MARK_PRICE"),
+            "priceProtect": payload.get("priceProtect", "false"),
+        }
+        if payload.get("newClientAlgoId"):
+            params["clientOrderId"] = payload["newClientAlgoId"]
+        return await exchange.create_order(symbol, order_type, side, 0, None, params)
     except Exception as e:
         err = str(e)
+        if '4130' in err:
+            return None  # Order already exists at same price — expected
         if '4120' in err:
             raise RuntimeError(
-                "STOP_ORDER_SWITCH_ALGO: must use /fapi/v1/algoOrder for conditional orders. "
-                "Post-Dec 2025 migration not applied."
+                "STOP_ORDER_SWITCH_ALGO: CCXT may be outdated (<4.5.27). "
+                "Post-Dec 2025 migration requires Algo Service routing."
             ) from e
         raise
 

@@ -479,20 +479,29 @@ class OrderManager:
             get_logger("OrderManager").error(f"[EMERGENCY_CLOSE_FAIL] {symbol}: {e}")
             return False
 
-    async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        """Cancel a single order. Returns True if successful."""
+    async def cancel_order(self, symbol: str, order_id: str, is_algo: bool = False) -> bool:
+        """Cancel a single order. For algo orders, uses /fapi/v1/algoOrder. Returns True if successful."""
         try:
-            await self.exchange.cancel_order(order_id, symbol)
+            if is_algo:
+                await self.exchange.cancel_order(order_id, symbol, params={'conditional': True})
+            else:
+                await self.exchange.cancel_order(order_id, symbol)
             return True
         except Exception:
             return False  # Order already filled or doesn't exist
 
-    async def check_order_filled(self, symbol: str, order_id: str) -> bool:
-        """Check if an order has been filled. Returns False if uncertain."""
+    async def check_order_filled(self, symbol: str, order_id: str, is_algo: bool = False) -> bool:
+        """Check if an order has been filled. For algo orders, queries /fapi/v1/algoOrder. Returns False if uncertain."""
         from .logger import get_logger
         try:
-            order = await self.exchange.fetch_order(order_id, symbol)
-            filled = order.get("status") == "closed" and float(order.get("filled", 0)) > 0
+            if is_algo:
+                order = await self.exchange.fetch_order(order_id, symbol, params={'conditional': True})
+                # Algo orders: FINISHED = filled, TRIGGERED = in matching engine
+                status = (order.get("algoStatus") or order.get("status") or "").upper()
+                filled = status in ("FINISHED", "CLOSED", "FILLED")
+            else:
+                order = await self.exchange.fetch_order(order_id, symbol)
+                filled = order.get("status") == "closed" and float(order.get("filled", 0)) > 0
             if filled:
                 get_logger("OrderManager").info(f"[ORDER_FILLED] {symbol} order={order_id}")
             return filled
