@@ -20,7 +20,9 @@ def _get_cache_key(prices: List[float], period: int, indicator_type: str) -> str
     if len(prices) < 2:
         return None
     # Use last price, second-to-last price, and period as key
-    key_data = (prices[-1], prices[-2] if len(prices) > 1 else 0, period, indicator_type)
+    # Use hash of last 5 prices + period for cache key — avoids collision across different series
+    tail = tuple(prices[-5:]) if len(prices) >= 5 else tuple(prices)
+    key_data = (tail, period, indicator_type)
     return str(key_data)
 
 def _is_cache_valid(timestamp: float) -> bool:
@@ -66,7 +68,9 @@ def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
         avg_gain = (avg_gain * (period - 1) + g) / period
         avg_loss = (avg_loss * (period - 1) + l) / period
 
-    if avg_loss == 0:
+    if avg_gain == 0 and avg_loss == 0:
+        rsi = 50.0  # No movement = neutral
+    elif avg_loss == 0:
         rsi = 100.0
     else:
         rs = avg_gain / avg_loss
@@ -114,12 +118,12 @@ def calculate_ema(prices: List[float], period: int, previous_ema: Optional[float
     # Start with SMA
     ema = sum(prices[-period:]) / period
     
-    # Calculate EMA for remaining prices
-    # OPTIMIZATION: Only iterate over new prices if previous_ema provided
-    start_idx = -period + 1 if previous_ema is None else -1
-    for price in prices[start_idx:]:
+    # Standard EMA: seed with first `period` prices (oldest), then iterate forward
+    # FIX: was incorrectly seeded with prices[-period:] (newest), over-weighting recent data
+    ema = sum(prices[:period]) / period
+    for price in prices[period:]:
         ema = (price * multiplier) + (ema * (1 - multiplier))
-    
+
     return ema
 
 
@@ -368,12 +372,12 @@ def calculate_trend_direction_from_prices(prices: List[float], ema_short: int = 
         ema_s = calculate_ema(prices, ema_short)
         ema_l = calculate_ema(prices, ema_long)
         
-        if ema_s is None or ema_l is None or len(ema_s) == 0 or len(ema_l) == 0:
+        if ema_s is None or ema_l is None:
             return 0
-        
-        # Compare most recent values
-        current_short = ema_s[-1]
-        current_long = ema_l[-1]
+
+        # calculate_ema returns a single float — compare directly
+        current_short = ema_s
+        current_long = ema_l
         
         # Trend strength threshold (1% difference)
         threshold = 0.01

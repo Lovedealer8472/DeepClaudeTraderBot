@@ -3914,6 +3914,7 @@ class ScalperBot:
 
         # Pre-initialize lightweight exchange for position monitoring.
         # Done at startup to avoid network calls inside the critical monitor path.
+        self._lightweight_ex_created = 0  # Set BEFORE try — prevents AttributeError on failure
         try:
             import ccxt.async_support as ccxt_async
             self._lightweight_ex = ccxt_async.binanceusdm({

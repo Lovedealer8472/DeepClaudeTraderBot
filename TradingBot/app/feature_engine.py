@@ -41,9 +41,10 @@ class FeatureEngine:
     ) -> Optional[pd.DataFrame]:
         """Fetch OHLCV data and convert to pandas DataFrame."""
         # REPLAY MODE: Get OHLCV from replay feed
-        if hasattr(self.bot, 'replay_mode') and self.bot.replay_mode and hasattr(self.bot, 'replay_feed') and self.bot.replay_feed:
+        _bot = getattr(self, 'bot', None)
+        if _bot is not None and getattr(_bot, 'replay_mode', False) and getattr(_bot, 'replay_feed', None):
             try:
-                ohlcv = self.bot.replay_feed.get_ohlcv(symbol, timeframe, limit)
+                ohlcv = _bot.replay_feed.get_ohlcv(symbol, timeframe, limit)
                 if not ohlcv or len(ohlcv) == 0:
                     return None
             except Exception:

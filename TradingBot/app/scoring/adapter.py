@@ -137,9 +137,9 @@ def build_signal_context(
             pos_base = pos_sym.split('/')[0] if '/' in pos_sym else pos_sym
             # Same sector = first 2 chars match (e.g., "SOL" and "SOLANA" are different)
             # or position side correlation with BTC trend suggests same risk factor
+            corr_to_btc_24h = symbol_stats.get('btc_correlation', 0.0) if symbol_stats else 0.0
             if pos_base[:2] == base[:2] or abs(corr_to_btc_24h) > 0.85:
                 open_positions_same_sector += 1
-    corr_to_btc_24h = symbol_stats.get('btc_correlation', 0.0)
 
     # Symbol rating — use reversal score as proxy for historical quality
     symbol_rating = 0.0

@@ -158,6 +158,7 @@ class TrailingStopEngine:
         
         def update_stop(candidate: float, reason: str, locked_r_value: Optional[float] = None):
             """Update stop loss if valid."""
+            nonlocal current_stop
             clamped = clamp_stop(candidate)
             if clamped is None:
                 return False
@@ -168,6 +169,7 @@ class TrailingStopEngine:
             trailing_state['last_update_ts'] = now_ts
             position['stop_loss'] = clamped
             position['last_trailing_update_ts'] = now_ts
+            current_stop = clamped  # Keep closure in sync — prevents backward movement
             if locked_r_value is not None:
                 position['locked_r'] = locked_r_value
             return True
