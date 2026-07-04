@@ -2401,34 +2401,33 @@ class ScalperBot:
                     
                     # Select exit profile based on signal score
                     exit_profile = self.exit_manager.select_exit_profile(signal.final_score)
-                    
-                    self.positions[entry_symbol] = {
+
+                    # Build position dict but DON'T track yet — must verify SL/TP first
+                    _new_position = {
                         "side": entry_side,
                         "size": filled_size,
                         "entry_price": entry_price,
                         "stop_loss": stop_loss_price,
-                        "initial_stop_price": initial_stop_price,  # SCALPER: Store initial stop for trailing
+                        "initial_stop_price": initial_stop_price,
                         "take_profit": signal.take_profit,
                         "entry_time": entry_time,
                         "signal_strength": signal.strength,
-                        "signal_score": signal.final_score,  # Store signal score for replacement logic
+                        "signal_score": signal.final_score,
                         "signal_type": signal.signal_type,
                         "atr_pct": atr_pct,
                         "leverage": final_leverage,
                         "peak_pnl": 0.0,
                         "rescue_flag": False,
                         "rescue_start_time": 0,
-                        "is_unicorn": is_unicorn,  # Track unicorn status for UI display
-                        "funding_rate": position_funding_rate,  # Store funding rate for cost calculation
-                        # R-based exit metadata
+                        "is_unicorn": is_unicorn,
+                        "funding_rate": position_funding_rate,
                         "initial_r": initial_r,
                         "exit_profile": exit_profile,
                         "max_r_reached": 0.0,
                         "bars_in_trade": 0,
                         "partial_exit_done": False,
                         "sl_moved_to_be": False,
-                        "last_bar_update_time": entry_time,  # Track last bar update for bar counting
-                        # MSX framework metadata
+                        "last_bar_update_time": entry_time,
                         "stage": 1,
                         "survived_msx1": False,
                         "peak_price": entry_price,
@@ -2477,7 +2476,7 @@ class ScalperBot:
                             break
 
                     if not (sl_ok and tp_ok):
-                        # Failed to protect — close position. Do not track.
+                        # Failed to protect — close position. DO NOT TRACK (position never added).
                         self.logger.critical(f"[UNPROTECTABLE] {entry_symbol} SL={sl_ok} TP={tp_ok} after 15 attempts — CLOSING")
                         for close_i in range(5):
                             try:
@@ -2491,10 +2490,12 @@ class ScalperBot:
                                 if close_i == 4:
                                     self.logger.critical(f"[UNPROTECTABLE_FATAL] {entry_symbol} cannot close: {e}")
                                 await asyncio.sleep(1)
-                        continue  # DO NOT TRACK — position is closed or will be caught by audit
+                        continue  # DO NOT TRACK — position is closed, _new_position not added
 
-                    self.positions[entry_symbol]["sl_order_id"] = sl_id
-                    self.positions[entry_symbol]["tp_order_id"] = tp_id
+                    # ONLY track AFTER verified SL+TP on exchange
+                    _new_position["sl_order_id"] = sl_id
+                    _new_position["tp_order_id"] = tp_id
+                    self.positions[entry_symbol] = _new_position
 
                     # LOGGING V2: Entry logging now handled by DecisionEvent (single concise line)
                     # Create canonical decision event for entry
