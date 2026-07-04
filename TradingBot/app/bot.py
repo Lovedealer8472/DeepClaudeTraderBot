@@ -2357,7 +2357,8 @@ class ScalperBot:
                     delay_ms=entry_delay,
                     use_limit=use_limit,
                     leverage=final_leverage,
-                    # SL/TP placed separately below — atomic attachment causes -2021 on volatile pairs
+                    stop_loss_price=signal.stop_loss,      # Atomic SL/TP — never enter naked
+                    take_profit_price=signal.take_profit,  # If -2021, entire order rejected, no fee paid
                 )
                 
                 # REMOVED: Individual entry result log (tracked via DecisionEvent)
