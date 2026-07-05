@@ -1043,6 +1043,20 @@ class ScalperBot:
         except Exception as e:
             self.logger.error(f"[EXIT_EXEC_ERROR] {symbol}: {type(e).__name__}: {e}")
 
+    async def _prefetch_news(self, ns, symbols: list):
+        """Background task: fetch news sentiment for all symbols, log summary."""
+        try:
+            results = await ns.prefetch_all(symbols, batch_size=10, batch_delay=2.0)
+            if results:
+                bullish = sum(1 for r in results.values() if r.sentiment == 'BULLISH')
+                bearish = sum(1 for r in results.values() if r.sentiment == 'BEARISH')
+                neutral = sum(1 for r in results.values() if r.sentiment == 'NEUTRAL')
+                self.logger.info(
+                    f'[MARKET] {len(results)} tokens scanned: '
+                    f'{bullish}▲BULLISH {bearish}▼BEARISH {neutral}─NEUTRAL')
+        except Exception as e:
+            self.logger.debug(f"[NEWS] prefetch skipped: {e}")
+
     async def _fetch_positions_lightweight(self) -> dict:
         """Fetch open positions using a dedicated lightweight exchange (separate connection pool).
         Returns {symbol: {'contracts': abs_amt, 'side': 'long'|'short', 'entryPrice': float}}."""
@@ -1936,19 +1950,14 @@ class ScalperBot:
                 except (NameError, UnboundLocalError):
                     _af = None
 
-                # NEWS SENTIMENT: per-token sentiment from Google News + Monolith Ollama
+                # NEWS SENTIMENT: read from cache (prefetched in background every 15 min)
                 _news_mod = 0
                 try:
                     from .news_sentiment import get_news_sentiment
                     _ns = get_news_sentiment()
                     _news_mod = await _ns.get_confluence_modifier(symbol, signal.side)
-                    if _news_mod != 0:
-                        _news_labels = {10: "BULLISH", -5: "BEARISH_OPPOSING", -10: "BEARISH"}
-                        self.logger.debug(
-                            f"[NEWS] {symbol} {signal.side}: {_news_labels.get(_news_mod, str(_news_mod))} "
-                            f"modifier={_news_mod:+d}")
                 except Exception:
-                    pass  # News module is optional — never block entry
+                    pass  # Never block entry
 
                 checklist = checklist_score(
                     side=signal.side,
@@ -2683,23 +2692,17 @@ class ScalperBot:
             # Log compact summary to file (INFO level)
             self.logger.info(summary)
             
-            # MARKET SENTIMENT SUMMARY: every 90 scans (~15 min), log per-token news sentiment
-            if not hasattr(self, '_news_summary_counter'):
-                self._news_summary_counter = 0
-            self._news_summary_counter += 1
-            if self._news_summary_counter % 90 == 0:
+            # NEWS SENTIMENT PREFETCH: every 90 scans (~15 min), background-scan ALL tokens
+            if not hasattr(self, '_news_prefetch_counter'):
+                self._news_prefetch_counter = 0
+            self._news_prefetch_counter += 1
+            if self._news_prefetch_counter % 90 == 0:
                 try:
                     from .news_sentiment import get_news_sentiment
                     _ns = get_news_sentiment()
-                    _sentiment_tokens = ['BTC/USDT','ETH/USDT','SOL/USDT','XRP/USDT']
-                    _lines = []
-                    for _t in _sentiment_tokens:
-                        _r = await _ns.get_sentiment(_t)
-                        if _r and _r.confidence >= 0.5:
-                            _arrow = '▲' if _r.sentiment == 'BULLISH' else ('▼' if _r.sentiment == 'BEARISH' else '─')
-                            _lines.append(f'{_t.split(\"/\")[0]}:{_arrow}{_r.sentiment}({_r.confidence:.0%})')
-                    if _lines:
-                        self.logger.info(f'[MARKET] {\" | \".join(_lines)}')
+                    _all_symbols = list(self.universe.stats.keys())[:200]  # Top 200 by volume
+                    # Run in background — don't block the scan loop
+                    asyncio.create_task(self._prefetch_news(_ns, _all_symbols))
                 except Exception:
                     pass
 
@@ -4076,6 +4079,15 @@ class ScalperBot:
                     self.logger.info(f"[STARTUP_ALGO] Reconciled {len(algo_state)} symbols with Algo Service")
             except Exception as e:
                 self.logger.warning(f"[STARTUP_ALGO] Algo reconciliation failed (non-fatal): {e}")
+
+        # NEWS SENTIMENT INITIAL PREFETCH: scan all tokens once at startup
+        try:
+            from .news_sentiment import get_news_sentiment
+            _ns = get_news_sentiment()
+            asyncio.create_task(self._prefetch_news(_ns, list(self.universe.stats.keys())[:200]))
+            self.logger.info("[STARTUP] News sentiment background scan started")
+        except Exception as e:
+            self.logger.warning(f"[STARTUP] News sentiment init skipped: {e}")
 
         # PRE-WARM FEATURE CACHE: compute AdvancedFeatures for top symbols before first scan
         if hasattr(self, 'feature_engine') and self.feature_engine:

@@ -93,6 +93,29 @@ class NewsSentiment:
         self._cache[symbol] = result
         return result
 
+    async def prefetch_all(self, symbols: List[str], batch_size: int = 10,
+                           batch_delay: float = 2.0) -> Dict[str, SentimentResult]:
+        """
+        Background batch scan of ALL tokens. Fetches news + runs sentiment.
+        Results cached for 15 min — bot scan loop reads instantly.
+        batch_delay: seconds between batches (respects Google News rate limits).
+        Returns dict of {symbol: SentimentResult} for tokens with news coverage.
+        """
+        results = {}
+        total = len(symbols)
+        for i in range(0, total, batch_size):
+            batch = symbols[i:i + batch_size]
+            tasks = [self.get_sentiment(s) for s in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for symbol, result in zip(batch, batch_results):
+                if isinstance(result, SentimentResult):
+                    results[symbol] = result
+                elif isinstance(result, Exception):
+                    pass  # Individual failures don't block the batch
+            if i + batch_size < total:
+                await asyncio.sleep(batch_delay)
+        return results
+
     async def get_confluence_modifier(self, symbol: str, side: str) -> int:
         """+10 if sentiment aligns with trade direction, -5 if opposes, 0 if neutral."""
         sentiment = await self.get_sentiment(symbol)
