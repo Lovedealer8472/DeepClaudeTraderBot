@@ -3981,13 +3981,24 @@ class ScalperBot:
                                 self.logger.error(f"[STARTUP] TP placement failed for {sym}: {e}")
 
                         # If protection failed, close the position — can't trade naked
-                        if not (has_sl and has_tp):
-                            self.logger.critical(f"[STARTUP] {sym} UNPROTECTABLE — closing position")
-                            try:
-                                await self.exchange_wrapper.create_order(sym, 'market', close_side, contracts, None,
-                                    {'reduceOnly': 'true'})
-                            except Exception as ce:
-                                self.logger.critical(f"[STARTUP] {sym} close also failed: {ce}")
+                        # Sub-dollar tokens: skip SL/TP, force-close immediately
+                        if not (has_sl and has_tp) or entry < 0.50:
+                            self.logger.critical(
+                                f"[STARTUP] {sym} UNPROTECTABLE (entry=\${entry:.4f}) — closing position")
+                            # Try up to 3 times with increasing aggression
+                            for close_attempt in range(3):
+                                try:
+                                    await self.exchange_wrapper.create_order(
+                                        sym, 'market', close_side, contracts, None,
+                                        {'reduceOnly': 'true'})
+                                    self.logger.info(f"[STARTUP] {sym} closed on attempt {close_attempt+1}")
+                                    break
+                                except Exception as ce:
+                                    if close_attempt == 2:
+                                        self.logger.critical(
+                                            f"[STARTUP] {sym} CANNOT CLOSE after 3 attempts: {ce}. "
+                                            f"Position UNPROTECTED on exchange!")
+                                    await asyncio.sleep(1)
                             continue
 
                         status = "SL+TP placed"
