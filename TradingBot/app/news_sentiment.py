@@ -1,22 +1,21 @@
 """
-Crypto news sentiment — local LLM via Ollama or keyword fallback.
+Crypto news sentiment — Google News RSS + local Ollama LLM.
 
-Fetches headlines from free RSS feeds / APIs, runs sentiment analysis,
-and exposes a per-symbol sentiment score for confluence scoring.
-
-Mode 1 (Ollama): llama3.2-3b running locally analyzes headlines
-Mode 2 (fallback): keyword-based sentiment (free, no GPU needed)
-
-Both modes output: BULLISH (+10pts), BEARISH (+10pts for shorts), NEUTRAL (0pts)
+Fetches per-token headlines from Google News (free, no API key, 100 headlines/query).
+Runs sentiment via Monolith Ollama (qwen3:8b) with keyword fallback.
+Exposes per-symbol confluence modifiers for scoring.
 """
 
 import asyncio
+import hashlib
 import json
 import re
 import time
+import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
-from collections import deque
+from urllib.parse import quote
 
 
 @dataclass
@@ -31,57 +30,25 @@ class SentimentResult:
 
 class NewsSentiment:
     """
-    Fetches crypto news and runs sentiment analysis.
-    Caches results per symbol with a 15-minute TTL.
+    Per-token crypto news sentiment using Google News RSS + local Ollama.
+    Cache: 15-min TTL per symbol. Feed cache: 5-min TTL (100 headlines/symbol).
     """
 
-    # Free RSS feeds — no API key required
-    RSS_FEEDS = [
-        "https://cointelegraph.com/rss",
-        "https://decrypt.co/feed",
-        "https://cryptoslate.com/feed/",
-        "https://cryptopotato.com/feed/",
-        "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    ]
-
-    # Simple keyword-based sentiment (fallback mode)
+    # Keyword fallback — fast, free, always available
     BULLISH_KEYWORDS = [
         "surge", "rally", "breakout", "bullish", "upgrade", "partnership",
         "launch", "adoption", "institutional", "etf", "approve", "record",
         "positive", "growth", "expansion", "accumulation", "support", "bounce",
         "reversal", "breakthrough", "listing", "integration", "mainnet",
+        "retakes", "retaking", "gains", "climb", "soar", "spike", "rebound",
     ]
     BEARISH_KEYWORDS = [
         "crash", "hack", "exploit", "sec", "lawsuit", "ban", "regulate",
         "crackdown", "bearish", "downgrade", "selloff", "liquidation",
         "decline", "loss", "debt", "default", "delay", "suspend", "halt",
-        "warning", "risk", "volatile", "uncertain", "fud",
+        "warning", "risk", "volatile", "uncertain", "fud", "dump", "plunge",
+        "tumble", "slide", "drop", "slump", "fall", "correction",
     ]
-
-    # Token name → common ticker mapping for headline matching
-    TOKEN_MAP = {
-        "bitcoin": "BTC/USDT",
-        "btc": "BTC/USDT",
-        "ethereum": "ETH/USDT",
-        "eth": "ETH/USDT",
-        "solana": "SOL/USDT",
-        "sol": "SOL/USDT",
-        "ripple": "XRP/USDT",
-        "xrp": "XRP/USDT",
-        "cardano": "ADA/USDT",
-        "ada": "ADA/USDT",
-        "avalanche": "AVAX/USDT",
-        "avax": "AVAX/USDT",
-        "polygon": "MATIC/USDT",
-        "matic": "MATIC/USDT",
-        "chainlink": "LINK/USDT",
-        "link": "LINK/USDT",
-        "near": "NEAR/USDT",
-        "dogecoin": "DOGE/USDT",
-        "doge": "DOGE/USDT",
-        "litecoin": "LTC/USDT",
-        "ltc": "LTC/USDT",
-    }
 
     def __init__(self, use_ollama: bool = True, ollama_model: str = "qwen3:8b",
                  ollama_host: str = "http://192.168.50.26:11434"):
@@ -90,47 +57,47 @@ class NewsSentiment:
         self._use_ollama = use_ollama
         self._ollama_model = ollama_model
         self._ollama_host = ollama_host
-        self._headline_history: deque = deque(maxlen=500)  # Dedup seen headlines
+        self._feed_cache: Dict[str, Tuple[float, List[str]]] = {}  # token → (timestamp, headlines)
+        self._feed_ttl = 300  # 5 minutes — Google News rate limiting
+        self._seen = set()  # Dedup hashes
+        self._max_headlines = 20  # Cap headlines per token for LLM analysis
 
     async def get_sentiment(self, symbol: str) -> Optional[SentimentResult]:
-        """Get sentiment for a symbol. Returns None if no news found."""
+        """Get sentiment for a symbol. Returns None if no headlines found."""
+        token = symbol.split("/")[0] if "/" in symbol else symbol
+
         # Check cache
         if symbol in self._cache:
             cached = self._cache[symbol]
             if time.time() - cached.timestamp < self._cache_ttl:
                 return cached
 
-        # Fetch and analyze
-        headlines = await self._fetch_headlines()
-        relevant = self._filter_relevant(headlines, symbol)
-
-        if not relevant:
+        # Fetch headlines
+        headlines = await self._fetch_google_news(token)
+        if not headlines:
             return None
 
+        # Run sentiment
         if self._use_ollama:
-            sentiment, confidence = await self._ollama_analyze(symbol, relevant)
+            sentiment, confidence = await self._ollama_analyze(token, headlines)
         else:
-            sentiment, confidence = self._keyword_analyze(relevant)
+            sentiment, confidence = self._keyword_analyze(headlines)
 
         result = SentimentResult(
             symbol=symbol,
             sentiment=sentiment,
             confidence=confidence,
-            source_count=len(relevant),
-            headlines=relevant[:5],
+            source_count=len(headlines),
+            headlines=headlines[:5],
         )
         self._cache[symbol] = result
         return result
 
     async def get_confluence_modifier(self, symbol: str, side: str) -> int:
-        """
-        Get confluence point modifier for a symbol+side.
-        Returns: +10 if sentiment aligns with trade direction, -10 if opposes, 0 if neutral.
-        """
+        """+10 if sentiment aligns with trade direction, -5 if opposes, 0 if neutral."""
         sentiment = await self.get_sentiment(symbol)
         if sentiment is None or sentiment.confidence < 0.5:
             return 0
-
         if sentiment.sentiment == "BULLISH" and side == "long":
             return 10
         elif sentiment.sentiment == "BEARISH" and side == "short":
@@ -141,113 +108,99 @@ class NewsSentiment:
             return -5
         return 0
 
-    async def _fetch_headlines(self) -> List[str]:
-        """Fetch headlines from RSS feeds. Returns deduplicated list."""
+    async def _fetch_google_news(self, token: str) -> List[str]:
+        """Fetch headlines from Google News RSS for a token. Cached per token."""
+        # Check feed cache
+        if token in self._feed_cache:
+            ts, headlines = self._feed_cache[token]
+            if time.time() - ts < self._feed_ttl:
+                return headlines
+
         try:
-            import feedparser
-        except ImportError:
+            query = quote(f"{token} cryptocurrency")
+            url = f"https://news.google.com/rss/search?q={query}&hl=en-US&ceid=US:en"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+            def _fetch():
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.read()
+
+            data = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+            root = ET.fromstring(data.decode("utf-8", errors="replace"))
+            items = root.findall(".//item")
+
+            headlines = []
+            for item in items:
+                title_elem = item.find("title")
+                if title_elem is not None and title_elem.text:
+                    title = title_elem.text.strip()
+                    h = hashlib.md5(title.encode()).hexdigest()
+                    if h not in self._seen:
+                        self._seen.add(h)
+                        headlines.append(title)
+                if len(headlines) >= self._max_headlines:
+                    break
+
+            # Trim seen set
+            if len(self._seen) > 10000:
+                self._seen = set(list(self._seen)[-5000:])
+
+            if headlines:
+                self._feed_cache[token] = (time.time(), headlines)
+            return headlines
+        except Exception:
+            # Return stale cache on error
+            if token in self._feed_cache:
+                _, headlines = self._feed_cache[token]
+                return headlines
             return []
 
-        headlines = []
-        for feed_url in self.RSS_FEEDS:
-            try:
-                feed = feedparser.parse(feed_url)
-                for entry in feed.entries[:10]:  # Top 10 per feed
-                    title = entry.get("title", "")
-                    if title and title not in self._headline_history:
-                        self._headline_history.append(title)
-                        headlines.append(title)
-            except Exception:
-                continue
-
-        return headlines
-
-    def _filter_relevant(self, headlines: List[str], symbol: str) -> List[str]:
-        """Filter headlines mentioning this symbol or its token name."""
-        # Extract token name from symbol (BTC/USDT → BTC, bitcoin)
-        token = symbol.split("/")[0].lower() if "/" in symbol else symbol.lower()
-
-        # Also check the reverse mapping
-        aliases = [token]
-        for name, ticker in self.TOKEN_MAP.items():
-            if ticker == symbol or name == token:
-                aliases.append(name)
-
-        relevant = []
-        for h in headlines:
-            h_lower = h.lower()
-            if any(alias in h_lower for alias in aliases):
-                relevant.append(h)
-            # Also catch general "crypto market" headlines for top tokens
-            elif token in ("btc", "eth") and any(
-                w in h_lower for w in ["crypto market", "bitcoin", "ethereum"]
-            ):
-                relevant.append(h)
-
-        return relevant[:10]  # Max 10 headlines
-
     def _keyword_analyze(self, headlines: List[str]) -> Tuple[str, float]:
-        """Simple keyword-based sentiment. Returns (sentiment, confidence)."""
+        """Keyword-based sentiment. Fast fallback when Ollama is down."""
         if not headlines:
             return "NEUTRAL", 0.0
-
         text = " ".join(headlines).lower()
-        bull_count = sum(1 for kw in self.BULLISH_KEYWORDS if kw in text)
-        bear_count = sum(1 for kw in self.BEARISH_KEYWORDS if kw in text)
-        total = bull_count + bear_count
-
+        bull = sum(1 for kw in self.BULLISH_KEYWORDS if kw in text)
+        bear = sum(1 for kw in self.BEARISH_KEYWORDS if kw in text)
+        total = bull + bear
         if total == 0:
             return "NEUTRAL", 0.0
+        if bull > bear * 1.5:
+            return "BULLISH", min(0.9, bull / max(total, 1))
+        elif bear > bull * 1.5:
+            return "BEARISH", min(0.9, bear / max(total, 1))
+        return "NEUTRAL", 0.3
 
-        if bull_count > bear_count * 1.5:
-            confidence = min(0.9, bull_count / max(total, 1))
-            return "BULLISH", confidence
-        elif bear_count > bull_count * 1.5:
-            confidence = min(0.9, bear_count / max(total, 1))
-            return "BEARISH", confidence
-        else:
-            return "NEUTRAL", 0.3
-
-    async def _ollama_analyze(self, symbol: str, headlines: List[str]) -> Tuple[str, float]:
-        """
-        Use local Ollama LLM to analyze headlines.
-        Returns (sentiment, confidence).
-        """
+    async def _ollama_analyze(self, token: str, headlines: List[str]) -> Tuple[str, float]:
+        """Ollama LLM analysis via Monolith. Returns (sentiment, confidence)."""
         if not headlines:
             return "NEUTRAL", 0.0
 
-        prompt = f"""Analyze these crypto news headlines about {symbol}.
-Classify the overall sentiment as exactly one word: BULLISH, BEARISH, or NEUTRAL.
+        prompt = f"""Analyze these crypto news headlines about {token}.
+Classify the overall short-term price sentiment as exactly one word: BULLISH, BEARISH, or NEUTRAL.
 Then give a confidence score from 0.0 to 1.0.
 
 Headlines:
 {chr(10).join(f'- {h}' for h in headlines[:10])}
 
-Respond in JSON format: {{"sentiment": "BULLISH|BEARISH|NEUTRAL", "confidence": 0.0-1.0}}"""
+Respond in JSON: {{"sentiment": "BULLISH|BEARISH|NEUTRAL", "confidence": 0.0-1.0}}"""
 
         try:
             import aiohttp
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{self._ollama_host}/api/generate",
-                    json={
-                        "model": self._ollama_model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "format": "json",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    json={"model": self._ollama_model, "prompt": prompt,
+                          "stream": False, "format": "json"},
+                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         inner = json.loads(data.get("response", "{}"))
                         return inner.get("sentiment", "NEUTRAL"), float(
-                            inner.get("confidence", 0.5)
-                        )
+                            inner.get("confidence", 0.5))
         except Exception:
             pass
-
-        # Fallback to keyword if Ollama unavailable
         return self._keyword_analyze(headlines)
 
 
@@ -255,7 +208,7 @@ Respond in JSON format: {{"sentiment": "BULLISH|BEARISH|NEUTRAL", "confidence": 
 _news_sentiment: Optional[NewsSentiment] = None
 
 
-def get_news_sentiment(use_ollama: bool = False) -> NewsSentiment:
+def get_news_sentiment(use_ollama: bool = True) -> NewsSentiment:
     global _news_sentiment
     if _news_sentiment is None:
         _news_sentiment = NewsSentiment(use_ollama=use_ollama)
