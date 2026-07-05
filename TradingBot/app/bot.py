@@ -1045,17 +1045,22 @@ class ScalperBot:
 
     async def _prefetch_news(self, ns, symbols: list):
         """Background task: fetch news sentiment for all symbols, log compact summary."""
+        import time as _time
+        _t0 = _time.time()
         try:
             results = await ns.prefetch_all(symbols, batch_size=8, batch_delay=3.0)
+            _elapsed = _time.time() - _t0
             if results:
                 B = [s.split('/')[0] for s, r in results.items() if r.sentiment == 'BULLISH']
                 E = [s.split('/')[0] for s, r in results.items() if r.sentiment == 'BEARISH']
                 N = len(results) - len(B) - len(E)
-                self.logger.info(f'[MARKET] {len(results)}t ▲{len(B)} ▼{len(E)} ─{N}')
+                self.logger.info(f'[MARKET] {len(results)}t ▲{len(B)} ▼{len(E)} ─{N} ({_elapsed:.0f}s)')
                 if B: self.logger.info(f'[MARKET] ▲ {\" \".join(B)}')
                 if E: self.logger.info(f'[MARKET] ▼ {\" \".join(E)}')
         except Exception as e:
-            self.logger.debug(f"[NEWS] prefetch skipped: {e}")
+            self.logger.warning(f"[NEWS] prefetch failed: {e}")
+        finally:
+            self._news_prefetch_active = False
 
     async def _fetch_positions_lightweight(self) -> dict:
         """Fetch open positions using a dedicated lightweight exchange (separate connection pool).
@@ -4096,8 +4101,9 @@ class ScalperBot:
                 _vol = getattr(_st, 'vol_quote', 0) or 0
                 if _px >= 0.01 and _vol >= 10_000_000:  # Wide net for discovery
                     _to_scan.append(_s)
+            self._news_prefetch_active = True
             asyncio.create_task(self._prefetch_news(_ns, _to_scan))
-            self.logger.info(f"[STARTUP] News scanning {len(_to_scan)} tokens (wide net)")
+            self.logger.info(f"[STARTUP] News background scan: {len(_to_scan)} tokens queued")
         except Exception as e:
             self.logger.warning(f"[STARTUP] News sentiment init skipped: {e}")
 
