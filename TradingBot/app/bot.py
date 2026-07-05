@@ -365,6 +365,8 @@ class ScalperBot:
                 
                 # Initialize order manager and exit manager with exchange wrapper
                 self.order_manager = OrderManager(self.exchange_wrapper)
+                # Wire DurableTracker for crash recovery
+                self.order_manager._durable_tracker = self.durable_tracker
                 self.exit_manager = ExitManager(self.exchange_wrapper, self.order_manager)
                 
                 # NEW ARCHITECTURE: Initialize unified ExitPipeline
@@ -3376,8 +3378,8 @@ class ScalperBot:
 
             # Process all queued exits
             processed = await self.exit_pipeline.process_exits(bot_instance=self)
-                # Circuit breaker: track all exits from pipeline
-                if processed > 0 and not hasattr(self, "_recent_exit_pnls"): self._recent_exit_pnls = []
+            # Circuit breaker: track all exits from pipeline
+            if processed > 0 and not hasattr(self, "_recent_exit_pnls"): self._recent_exit_pnls = []
             if processed > 0:
                 self.logger.debug(f"ExitPipeline processed {processed} exits")
         else:
@@ -4007,6 +4009,37 @@ class ScalperBot:
                     self.logger.info("[STARTUP] No stale positions — clean slate")
             except Exception as e:
                 self.logger.warning(f"[STARTUP] Stale position check failed: {e}")
+
+        # STARTUP ALGO RECONCILIATION: cross-check Algo Service orders (post-Dec 2025)
+        if self.exchange_wrapper and self.exchange_wrapper.exchange:
+            try:
+                from .exchanges.binance_algo import startup_algo_reconciliation, AlgoStatus
+                tracked_symbols = list(self.positions.keys())
+                algo_state = await startup_algo_reconciliation(
+                    self.exchange_wrapper.exchange, tracked_symbols)
+                for sym, algos in algo_state.items():
+                    has_sl = any(a.purpose == "SL" and a.status == AlgoStatus.NEW for a in algos)
+                    has_tp = any(a.purpose == "TP" and a.status == AlgoStatus.NEW for a in algos)
+                    if sym in self.positions:
+                        if has_sl: self.positions[sym]['sl_order_id'] = 'EXISTS'
+                        if has_tp: self.positions[sym]['tp_order_id'] = 'EXISTS'
+                    self.logger.info(
+                        f"[STARTUP_ALGO] {sym}: SL={'✓' if has_sl else '✗'} TP={'✓' if has_tp else '✗'} "
+                        f"({len(algos)} algo orders)")
+                if algo_state:
+                    self.logger.info(f"[STARTUP_ALGO] Reconciled {len(algo_state)} symbols with Algo Service")
+            except Exception as e:
+                self.logger.warning(f"[STARTUP_ALGO] Algo reconciliation failed (non-fatal): {e}")
+
+        # PRE-WARM FEATURE CACHE: compute AdvancedFeatures for top symbols before first scan
+        if hasattr(self, 'feature_engine') and self.feature_engine:
+            try:
+                from .prewarmer import prewarm_feature_cache
+                warmed = await prewarm_feature_cache(
+                    self.feature_engine, self.exchange_wrapper, top_n=20, max_concurrent=3)
+                self.logger.info(f"[STARTUP] Feature cache pre-warmed: {warmed} symbols")
+            except Exception as e:
+                self.logger.warning(f"[STARTUP] Feature pre-warm skipped: {e}")
 
         # Initialize Rich UI based on UI_MODE
         from .config import UI_MODE

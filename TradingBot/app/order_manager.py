@@ -33,6 +33,20 @@ class OrderManager:
         self.order_history = []
         self.leverage_cache = {}  # Cache for leverage settings
         self.logger = get_logger("OrderManager")
+        self._durable_tracker = None  # Set by bot after init
+
+    def _track_order(self, symbol: str, order_type: str, side: str,
+                     purpose: str, exchange_order_id: str,
+                     price: float, qty: float):
+        """Record order in DurableTracker for crash recovery."""
+        try:
+            if self._durable_tracker is not None:
+                self._durable_tracker.track(
+                    symbol=symbol, order_type=order_type, side=side,
+                    purpose=purpose, exchange_order_id=exchange_order_id,
+                    quantity=qty, stop_price=price)
+        except Exception:
+            pass  # Non-critical — tracker is best-effort
     
     async def enter_position(
         self,
@@ -414,6 +428,8 @@ class OrderManager:
                 {"stopPrice": stop_price, "closePosition": True}
             )
             oid = order.get("id")
+            # DurableTracker: record submission for crash recovery
+            self._track_order(symbol, "STOP_MARKET", order_side, "sl", oid, stop_price, size)
             get_logger("OrderManager").info(f"[SL_PLACED] {symbol} SL @ {stop_price:.6f} id={oid}")
             return oid
         except Exception as e:
@@ -440,6 +456,8 @@ class OrderManager:
                 {"stopPrice": take_profit_price, "closePosition": True}
             )
             oid = order.get("id")
+            # DurableTracker: record submission for crash recovery
+            self._track_order(symbol, "TAKE_PROFIT_MARKET", order_side, "tp", oid, take_profit_price, size)
             get_logger("OrderManager").info(f"[TP_PLACED] {symbol} TP @ {take_profit_price:.6f} id={oid}")
             return oid
         except Exception as e:
