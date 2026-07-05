@@ -50,6 +50,7 @@ def score_signal(
     spread_bps: float = 9999.0,
     advanced_features=None,
     current_price: float = 0.0,
+    news_modifier: int = 0,  # +10 BULLISH, -10 BEARISH (from news_sentiment module)
 ) -> ChecklistScore:
     """
     Confluence scoring for structure-based entries.
@@ -190,8 +191,8 @@ def score_signal(
 
     # Penalties
     if is_weekend:
-        confluence -= 15
-        penalties.append("weekend(-15)")
+        confluence -= 5   # Reduced from -15 — experimental, revert if bleeding
+        penalties.append("weekend(-5)")
 
     if fighting_htf:
         confluence -= 20
@@ -200,6 +201,11 @@ def score_signal(
         if vol_ratio >= 2.0 and has_divergence:
             confluence += 15  # Partial restore for extreme setups
             penalties.append("extreme_override(+15)")
+
+    # News sentiment modifier (from local LLM or keyword analysis)
+    if news_modifier != 0:
+        confluence += news_modifier
+        penalties.append(f"news({news_modifier:+d})")
 
     details["penalties"] = "+".join(penalties) if penalties else "none"
 
