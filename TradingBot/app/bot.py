@@ -1936,6 +1936,20 @@ class ScalperBot:
                 except (NameError, UnboundLocalError):
                     _af = None
 
+                # NEWS SENTIMENT: per-token sentiment from Google News + Monolith Ollama
+                _news_mod = 0
+                try:
+                    from .news_sentiment import get_news_sentiment
+                    _ns = get_news_sentiment()
+                    _news_mod = await _ns.get_confluence_modifier(symbol, signal.side)
+                    if _news_mod != 0:
+                        _news_labels = {10: "BULLISH", -5: "BEARISH_OPPOSING", -10: "BEARISH"}
+                        self.logger.debug(
+                            f"[NEWS] {symbol} {signal.side}: {_news_labels.get(_news_mod, str(_news_mod))} "
+                            f"modifier={_news_mod:+d}")
+                except Exception:
+                    pass  # News module is optional — never block entry
+
                 checklist = checklist_score(
                     side=signal.side,
                     symbol_stats=symbol_stats,
@@ -1945,6 +1959,7 @@ class ScalperBot:
                     spread_bps=getattr(stats, 'spread_bps', 9999.0),
                     advanced_features=_af,
                     current_price=_entry_price,
+                    news_modifier=_news_mod,
                 )
 
                 # Need 3/5 to pass
@@ -2668,6 +2683,26 @@ class ScalperBot:
             # Log compact summary to file (INFO level)
             self.logger.info(summary)
             
+            # MARKET SENTIMENT SUMMARY: every 90 scans (~15 min), log per-token news sentiment
+            if not hasattr(self, '_news_summary_counter'):
+                self._news_summary_counter = 0
+            self._news_summary_counter += 1
+            if self._news_summary_counter % 90 == 0:
+                try:
+                    from .news_sentiment import get_news_sentiment
+                    _ns = get_news_sentiment()
+                    _sentiment_tokens = ['BTC/USDT','ETH/USDT','SOL/USDT','XRP/USDT']
+                    _lines = []
+                    for _t in _sentiment_tokens:
+                        _r = await _ns.get_sentiment(_t)
+                        if _r and _r.confidence >= 0.5:
+                            _arrow = '▲' if _r.sentiment == 'BULLISH' else ('▼' if _r.sentiment == 'BEARISH' else '─')
+                            _lines.append(f'{_t.split(\"/\")[0]}:{_arrow}{_r.sentiment}({_r.confidence:.0%})')
+                    if _lines:
+                        self.logger.info(f'[MARKET] {\" | \".join(_lines)}')
+                except Exception:
+                    pass
+
             # Also add to UI buffer (for UI LOG panel)
             log_buffer = get_log_buffer()
             log_buffer.append(
