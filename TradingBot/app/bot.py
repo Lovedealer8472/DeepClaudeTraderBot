@@ -2700,14 +2700,14 @@ class ScalperBot:
                 try:
                     from .news_sentiment import get_news_sentiment
                     _ns = get_news_sentiment()
-                    # Filter to tradeable tokens only ($2+, $50M+ volume)
-                    _tradeable = []
+                    # Wide net for news discovery ($0.01+, $10M+ vol)
+                    _to_scan = []
                     for _s, _st in self.universe.stats.items():
                         _px = getattr(_st, 'mark', 0) or getattr(_st, 'last', 0)
                         _vol = getattr(_st, 'vol_quote', 0) or 0
-                        if _px >= 2.00 and _vol >= 50_000_000:
-                            _tradeable.append(_s)
-                    asyncio.create_task(self._prefetch_news(_ns, _tradeable))
+                        if _px >= 0.01 and _vol >= 10_000_000:
+                            _to_scan.append(_s)
+                    asyncio.create_task(self._prefetch_news(_ns, _to_scan))
                 except Exception:
                     pass
 
@@ -4089,15 +4089,15 @@ class ScalperBot:
         try:
             from .news_sentiment import get_news_sentiment
             _ns = get_news_sentiment()
-            # Filter: only tokens we'd actually trade ($2+ price, $50M+ volume)
-            _tradeable = []
+            # News scan: broader set than trading floor — find the gems
+            _to_scan = []
             for _s, _st in self.universe.stats.items():
                 _px = getattr(_st, 'mark', 0) or getattr(_st, 'last', 0)
                 _vol = getattr(_st, 'vol_quote', 0) or 0
-                if _px >= 2.00 and _vol >= 50_000_000:
-                    _tradeable.append(_s)
-            asyncio.create_task(self._prefetch_news(_ns, _tradeable))
-            self.logger.info(f"[STARTUP] News sentiment scanning {len(_tradeable)} tradeable tokens")
+                if _px >= 0.01 and _vol >= 10_000_000:  # Wide net for discovery
+                    _to_scan.append(_s)
+            asyncio.create_task(self._prefetch_news(_ns, _to_scan))
+            self.logger.info(f"[STARTUP] News scanning {len(_to_scan)} tokens (wide net)")
         except Exception as e:
             self.logger.warning(f"[STARTUP] News sentiment init skipped: {e}")
 
