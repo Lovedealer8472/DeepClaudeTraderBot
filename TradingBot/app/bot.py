@@ -1044,16 +1044,16 @@ class ScalperBot:
             self.logger.error(f"[EXIT_EXEC_ERROR] {symbol}: {type(e).__name__}: {e}")
 
     async def _prefetch_news(self, ns, symbols: list):
-        """Background task: fetch news sentiment for all symbols, log summary."""
+        """Background task: fetch news sentiment for all symbols, log compact summary."""
         try:
-            results = await ns.prefetch_all(symbols, batch_size=10, batch_delay=2.0)
+            results = await ns.prefetch_all(symbols, batch_size=8, batch_delay=3.0)
             if results:
-                bullish = sum(1 for r in results.values() if r.sentiment == 'BULLISH')
-                bearish = sum(1 for r in results.values() if r.sentiment == 'BEARISH')
-                neutral = sum(1 for r in results.values() if r.sentiment == 'NEUTRAL')
-                self.logger.info(
-                    f'[MARKET] {len(results)} tokens scanned: '
-                    f'{bullish}▲BULLISH {bearish}▼BEARISH {neutral}─NEUTRAL')
+                B = [s.split('/')[0] for s, r in results.items() if r.sentiment == 'BULLISH']
+                E = [s.split('/')[0] for s, r in results.items() if r.sentiment == 'BEARISH']
+                N = len(results) - len(B) - len(E)
+                self.logger.info(f'[MARKET] {len(results)}t ▲{len(B)} ▼{len(E)} ─{N}')
+                if B: self.logger.info(f'[MARKET] ▲ {\" \".join(B)}')
+                if E: self.logger.info(f'[MARKET] ▼ {\" \".join(E)}')
         except Exception as e:
             self.logger.debug(f"[NEWS] prefetch skipped: {e}")
 
