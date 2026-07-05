@@ -2701,7 +2701,7 @@ class ScalperBot:
             if not hasattr(self, '_news_prefetch_counter'):
                 self._news_prefetch_counter = 0
             self._news_prefetch_counter += 1
-            if self._news_prefetch_counter % 90 == 0:
+            if self._news_prefetch_counter % 30 == 0:  # ~5 min (was 90/~15min)
                 try:
                     from .news_sentiment import get_news_sentiment
                     _ns = get_news_sentiment()
@@ -4089,23 +4089,6 @@ class ScalperBot:
                     self.logger.info(f"[STARTUP_ALGO] Reconciled {len(algo_state)} symbols with Algo Service")
             except Exception as e:
                 self.logger.warning(f"[STARTUP_ALGO] Algo reconciliation failed (non-fatal): {e}")
-
-        # NEWS SENTIMENT INITIAL PREFETCH: scan only tradeable tokens
-        try:
-            from .news_sentiment import get_news_sentiment
-            _ns = get_news_sentiment()
-            # News scan: broader set than trading floor — find the gems
-            _to_scan = []
-            for _s, _st in self.universe.stats.items():
-                _px = getattr(_st, 'mark', 0) or getattr(_st, 'last', 0)
-                _vol = getattr(_st, 'vol_quote', 0) or 0
-                if _px >= 0.01 and _vol >= 10_000_000:  # Wide net for discovery
-                    _to_scan.append(_s)
-            self._news_prefetch_active = True
-            asyncio.create_task(self._prefetch_news(_ns, _to_scan))
-            self.logger.info(f"[STARTUP] News background scan: {len(_to_scan)} tokens queued")
-        except Exception as e:
-            self.logger.warning(f"[STARTUP] News sentiment init skipped: {e}")
 
         # PRE-WARM FEATURE CACHE: compute AdvancedFeatures for top symbols before first scan
         if hasattr(self, 'feature_engine') and self.feature_engine:
