@@ -1044,21 +1044,18 @@ class ScalperBot:
             self.logger.error(f"[EXIT_EXEC_ERROR] {symbol}: {type(e).__name__}: {e}")
 
     async def _prefetch_news(self, ns, symbols: list):
-        """Background task: fetch news sentiment for all symbols, log compact summary."""
+        """Background task: fetch news sentiment for all tokens. Autonomous — no human review needed."""
         import time as _time
         _t0 = _time.time()
         try:
             results = await ns.prefetch_all(symbols, batch_size=8, batch_delay=3.0)
             _elapsed = _time.time() - _t0
             if results:
-                B = [s.split('/')[0] for s, r in results.items() if r.sentiment == 'BULLISH']
-                E = [s.split('/')[0] for s, r in results.items() if r.sentiment == 'BEARISH']
-                N = len(results) - len(B) - len(E)
-                self.logger.info(f'[MARKET] {len(results)}t ▲{len(B)} ▼{len(E)} ─{N} ({_elapsed:.0f}s)')
-                if B: self.logger.info(f'[MARKET] ▲ {\" \".join(B)}')
-                if E: self.logger.info(f'[MARKET] ▼ {\" \".join(E)}')
+                B = sum(1 for r in results.values() if r.sentiment == 'BULLISH')
+                E = sum(1 for r in results.values() if r.sentiment == 'BEARISH')
+                self.logger.info(f'[NEWS] {len(results)}t ▲{B} ▼{E} ({_elapsed:.0f}s)')  # Single heartbeat
         except Exception as e:
-            self.logger.warning(f"[NEWS] prefetch failed: {e}")
+            pass  # Silent — never spam the log
         finally:
             self._news_prefetch_active = False
 
@@ -2701,11 +2698,10 @@ class ScalperBot:
             if not hasattr(self, '_news_prefetch_counter'):
                 self._news_prefetch_counter = 0
             self._news_prefetch_counter += 1
-            if self._news_prefetch_counter % 30 == 0:  # ~5 min (was 90/~15min)
+            if self._news_prefetch_counter % 60 == 0:  # ~10 min
                 try:
                     from .news_sentiment import get_news_sentiment
                     _ns = get_news_sentiment()
-                    # Wide net for news discovery ($0.01+, $10M+ vol)
                     _to_scan = []
                     for _s, _st in self.universe.stats.items():
                         _px = getattr(_st, 'mark', 0) or getattr(_st, 'last', 0)
