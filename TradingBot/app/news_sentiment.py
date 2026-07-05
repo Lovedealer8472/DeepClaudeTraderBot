@@ -83,11 +83,13 @@ class NewsSentiment:
         "ltc": "LTC/USDT",
     }
 
-    def __init__(self, use_ollama: bool = False, ollama_model: str = "llama3.2:3b"):
+    def __init__(self, use_ollama: bool = True, ollama_model: str = "qwen3:8b",
+                 ollama_host: str = "http://192.168.50.26:11434"):
         self._cache: Dict[str, SentimentResult] = {}
         self._cache_ttl = 900  # 15 minutes
         self._use_ollama = use_ollama
         self._ollama_model = ollama_model
+        self._ollama_host = ollama_host
         self._headline_history: deque = deque(maxlen=500)  # Dedup seen headlines
 
     async def get_sentiment(self, symbol: str) -> Optional[SentimentResult]:
@@ -227,7 +229,7 @@ Respond in JSON format: {{"sentiment": "BULLISH|BEARISH|NEUTRAL", "confidence": 
             import aiohttp
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    "http://localhost:11434/api/generate",
+                    f"{self._ollama_host}/api/generate",
                     json={
                         "model": self._ollama_model,
                         "prompt": prompt,
