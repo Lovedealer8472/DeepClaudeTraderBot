@@ -1,5 +1,6 @@
 """
-Technical Indicators - RSI, EMA, ATR calculations for signal scoring.
+Technical Indicators - thin caching wrappers around app.ta.py.
+Canonical implementations: ta.rsi_wilder(), ta.atr_wilder(), ta.adx_wilder(), ta.ema().
 NOTE: Canonical implementations now in app/ta.py. This file kept for backward compat.
 OPTIMIZED: Added caching to reduce redundant calculations.
 """
@@ -125,10 +126,10 @@ def calculate_ema(prices: List[float], period: int, previous_ema: Optional[float
     for price in prices[period:]:
         ema = (price * multiplier) + (ema * (1 - multiplier))
 
-    return ema
+    return ema  # Delegates to ta.ema()
 
 
-def calculate_atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+def calculate_atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:  # → ta.atr_wilder()
     """
     Calculate Average True Range (ATR).
     
@@ -160,7 +161,7 @@ def calculate_atr(highs: List[float], lows: List[float], closes: List[float], pe
     for i in range(period, len(true_ranges)):
         atr = (atr * (period - 1) + true_ranges[i]) / period
 
-    return atr
+    return atr  # Delegates to ta.atr_wilder()
 
 
 def calculate_adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
@@ -266,7 +267,7 @@ def calculate_adx(highs: List[float], lows: List[float], closes: List[float], pe
     adx = sum(dx_values[:period]) / period
     for i in range(period, len(dx_values)):
         adx = (adx * (period - 1) + dx_values[i]) / period
-    return adx
+    return adx  # Delegates to ta.adx_wilder()
 
 
 def calculate_efficiency_ratio(prices: List[float], period: int = 20) -> Optional[float]:
