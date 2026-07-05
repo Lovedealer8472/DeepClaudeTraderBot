@@ -413,64 +413,117 @@ class OrderManager:
         return signal_strength > 0.8
 
     # ═══════════════════════════════════════════════════════
-    # SL/TP ORDER MANAGEMENT (Binance Futures — no OCO)
+    # SL/TP ORDER MANAGEMENT (Binance Futures — Algo Service)
     # ═══════════════════════════════════════════════════════
+
+    async def _place_with_retry(
+        self, symbol: str, order_type: str, side: str, size: float,
+        price: float, purpose: str, max_retries: int = 4
+    ) -> Optional[str]:
+        """
+        Place a conditional order with Freqtrade-style quadratic backoff retry.
+        Backoff: (max_retries - retrycount)^2 + 1 → 1s, 2s, 5s, 10s.
+        After retry, re-queries exchange to recover lost order state.
+        Returns order_id, 'EXISTS', or None.
+        """
+        import asyncio
+        from .logger import get_logger
+        from .error_catalog import classify, ErrorCategory
+
+        logger = get_logger("OrderManager")
+        order_side = "sell" if side == "long" else "buy"
+
+        for retrycount in range(max_retries + 1):
+            try:
+                order = await self.exchange.create_order(
+                    symbol, order_type, order_side, size, None,
+                    {"stopPrice": price, "closePosition": True}
+                )
+                oid = order.get("id")
+                self._track_order(symbol, order_type, order_side, purpose, oid, price, size)
+                if retrycount > 0:
+                    logger.info(
+                        f"[{purpose.upper()}_RETRY_OK] {symbol} succeeded on retry {retrycount} "
+                        f"@ {price:.6f} id={oid}")
+                else:
+                    logger.info(f"[{purpose.upper()}_PLACED] {symbol} @ {price:.6f} id={oid}")
+                return oid
+            except Exception as e:
+                err = str(e)
+                cat, strategy, desc = classify(err)
+
+                # -4130: order already exists at same price — success
+                if cat == ErrorCategory.ALREADY_PROTECTED:
+                    logger.info(f"[{purpose.upper()}_EXISTS] {symbol} — closePosition order active")
+                    return "EXISTS"
+
+                # -2021: would immediately trigger — not retryable, price is wrong
+                if '2021' in err:
+                    logger.warning(
+                        f"[{purpose.upper()}_SKIP] {symbol} — stop too close to market, not retrying")
+                    return None
+
+                # Network/timeout/rate-limit errors — RETRY with backoff
+                if retrycount < max_retries and (
+                    cat in (ErrorCategory.NETWORK_ERROR, ErrorCategory.RATE_LIMIT,
+                            ErrorCategory.NO_POSITION) or
+                    'ConnectionError' in err or 'Timeout' in err or 'timed out' in err or
+                    '1005' in err or '1015' in err or '1021' in err or '1013' in err or
+                    'TemporaryError' in err or 'DDosProtection' in err
+                ):
+                    delay = (max_retries - retrycount) ** 2 + 1
+                    logger.warning(
+                        f"[{purpose.upper()}_RETRY] {symbol} attempt {retrycount+1}/{max_retries}: "
+                        f"{desc} — backing off {delay}s")
+                    await asyncio.sleep(delay)
+                    # Re-query exchange: did the order land despite the error?
+                    if retrycount >= 2:
+                        try:
+                            existing = await self._find_existing_algo(symbol, purpose, price)
+                            if existing:
+                                logger.info(
+                                    f"[{purpose.upper()}_RECOVERED] {symbol} — order existed "
+                                    f"on exchange despite error, id={existing}")
+                                return existing
+                        except Exception:
+                            pass
+                    continue
+
+                # Hard failure — not retryable
+                logger.error(f"[{purpose.upper()}_FAIL] {symbol}: {cat.value} — {err[:100]}")
+                return None
+
+        return None
+
+    async def _find_existing_algo(self, symbol: str, purpose: str,
+                                   trigger_price: float) -> Optional[str]:
+        """Check if an algo order already exists at approximately this price."""
+        try:
+            open_orders = await self.exchange.fetch_open_orders(
+                symbol, params={'conditional': True})
+            for o in open_orders:
+                o_price = float(o.get('triggerPrice', o.get('stopPrice', o.get('price', 0))))
+                o_type = o.get('type', '')
+                is_sl = 'STOP' in o_type and 'TAKE' not in o_type and 'TRAILING' not in o_type
+                is_tp = 'TAKE_PROFIT' in o_type
+                matches = (purpose == 'sl' and is_sl) or (purpose == 'tp' and is_tp)
+                if matches and abs(o_price - trigger_price) / trigger_price < 0.001:
+                    return str(o.get('id', ''))
+        except Exception:
+            pass
+        return None
 
     async def place_sl_order(self, symbol: str, side: str, size: float,
                               stop_price: float) -> Optional[str]:
-        """Place STOP_MARKET order for stop-loss. Returns order_id, 'EXISTS', or None."""
-        from .logger import get_logger
-        from .error_catalog import classify, ErrorCategory
-        try:
-            order_side = "sell" if side == "long" else "buy"
-            order = await self.exchange.create_order(
-                symbol, "STOP_MARKET", order_side, size, None,
-                {"stopPrice": stop_price, "closePosition": True}
-            )
-            oid = order.get("id")
-            # DurableTracker: record submission for crash recovery
-            self._track_order(symbol, "STOP_MARKET", order_side, "sl", oid, stop_price, size)
-            get_logger("OrderManager").info(f"[SL_PLACED] {symbol} SL @ {stop_price:.6f} id={oid}")
-            return oid
-        except Exception as e:
-            err = str(e)
-            cat, strategy, desc = classify(err)
-            if cat == ErrorCategory.ALREADY_PROTECTED:
-                get_logger("OrderManager").info(f"[SL_EXISTS] {symbol} — closePosition order active (expected)")
-                return "EXISTS"
-            if cat == ErrorCategory.NO_POSITION:
-                get_logger("OrderManager").warning(f"[SL_RETRY] {symbol} position not visible yet — retrying")
-                return None  # Caller should retry
-            get_logger("OrderManager").error(f"[SL_FAIL] {symbol}: {cat.value} — {err[:100]}")
-            return None
+        """Place STOP_MARKET order with retry. Returns order_id, 'EXISTS', or None."""
+        return await self._place_with_retry(
+            symbol, "STOP_MARKET", side, size, stop_price, "sl")
 
     async def place_tp_order(self, symbol: str, side: str, size: float,
                               take_profit_price: float) -> Optional[str]:
-        """Place TAKE_PROFIT_MARKET order. Returns order_id, 'EXISTS', or None."""
-        from .logger import get_logger
-        from .error_catalog import classify, ErrorCategory
-        try:
-            order_side = "sell" if side == "long" else "buy"
-            order = await self.exchange.create_order(
-                symbol, "TAKE_PROFIT_MARKET", order_side, size, None,
-                {"stopPrice": take_profit_price, "closePosition": True}
-            )
-            oid = order.get("id")
-            # DurableTracker: record submission for crash recovery
-            self._track_order(symbol, "TAKE_PROFIT_MARKET", order_side, "tp", oid, take_profit_price, size)
-            get_logger("OrderManager").info(f"[TP_PLACED] {symbol} TP @ {take_profit_price:.6f} id={oid}")
-            return oid
-        except Exception as e:
-            err = str(e)
-            cat, strategy, desc = classify(err)
-            if cat == ErrorCategory.ALREADY_PROTECTED:
-                get_logger("OrderManager").info(f"[TP_EXISTS] {symbol} — closePosition order active (expected)")
-                return "EXISTS"
-            if cat == ErrorCategory.NO_POSITION:
-                get_logger("OrderManager").warning(f"[TP_RETRY] {symbol} position not visible yet — retrying")
-                return None
-            get_logger("OrderManager").error(f"[TP_FAIL] {symbol}: {cat.value} — {err[:100]}")
-            return None
+        """Place TAKE_PROFIT_MARKET order with retry. Returns order_id, 'EXISTS', or None."""
+        return await self._place_with_retry(
+            symbol, "TAKE_PROFIT_MARKET", side, size, take_profit_price, "tp")
 
     async def cancel_all_orders(self, symbol: str) -> bool:
         """Cancel ALL open orders for a symbol. Returns True if successful."""
