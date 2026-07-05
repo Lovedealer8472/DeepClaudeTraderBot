@@ -2700,9 +2700,14 @@ class ScalperBot:
                 try:
                     from .news_sentiment import get_news_sentiment
                     _ns = get_news_sentiment()
-                    _all_symbols = list(self.universe.stats.keys())[:200]  # Top 200 by volume
-                    # Run in background — don't block the scan loop
-                    asyncio.create_task(self._prefetch_news(_ns, _all_symbols))
+                    # Filter to tradeable tokens only ($2+, $50M+ volume)
+                    _tradeable = []
+                    for _s, _st in self.universe.stats.items():
+                        _px = getattr(_st, 'mark', 0) or getattr(_st, 'last', 0)
+                        _vol = getattr(_st, 'vol_quote', 0) or 0
+                        if _px >= 2.00 and _vol >= 50_000_000:
+                            _tradeable.append(_s)
+                    asyncio.create_task(self._prefetch_news(_ns, _tradeable))
                 except Exception:
                     pass
 
@@ -4080,12 +4085,19 @@ class ScalperBot:
             except Exception as e:
                 self.logger.warning(f"[STARTUP_ALGO] Algo reconciliation failed (non-fatal): {e}")
 
-        # NEWS SENTIMENT INITIAL PREFETCH: scan all tokens once at startup
+        # NEWS SENTIMENT INITIAL PREFETCH: scan only tradeable tokens
         try:
             from .news_sentiment import get_news_sentiment
             _ns = get_news_sentiment()
-            asyncio.create_task(self._prefetch_news(_ns, list(self.universe.stats.keys())[:200]))
-            self.logger.info("[STARTUP] News sentiment background scan started")
+            # Filter: only tokens we'd actually trade ($2+ price, $50M+ volume)
+            _tradeable = []
+            for _s, _st in self.universe.stats.items():
+                _px = getattr(_st, 'mark', 0) or getattr(_st, 'last', 0)
+                _vol = getattr(_st, 'vol_quote', 0) or 0
+                if _px >= 2.00 and _vol >= 50_000_000:
+                    _tradeable.append(_s)
+            asyncio.create_task(self._prefetch_news(_ns, _tradeable))
+            self.logger.info(f"[STARTUP] News sentiment scanning {len(_tradeable)} tradeable tokens")
         except Exception as e:
             self.logger.warning(f"[STARTUP] News sentiment init skipped: {e}")
 
