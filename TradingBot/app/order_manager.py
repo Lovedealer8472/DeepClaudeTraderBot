@@ -116,11 +116,10 @@ class OrderManager:
                     latency_ms=(time.time() - start_time) * 1000
                 )
             else:
+                # SL/TP placed separately after entry — atomic attachment
+                # causes -2021 on sub-$1 tokens where tick granularity makes
+                # the stop distance invalid. Bot handles protection at lines 2514+.
                 order_params = {}
-                if stop_loss_price:
-                    order_params['stopLossPrice'] = stop_loss_price
-                if take_profit_price:
-                    order_params['takeProfitPrice'] = take_profit_price
 
                 if use_limit:
                     result = await self._place_limit_order(

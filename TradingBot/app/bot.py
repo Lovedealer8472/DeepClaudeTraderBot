@@ -835,7 +835,22 @@ class ScalperBot:
             self.universe.set_btc_trend(self.btc_trend)
         else:
             self.universe.set_btc_trend(0.0)
-        
+
+        # Inject top 10 movers into active set every cycle
+        _all_movers = [(s, getattr(st, 'pct_change_24h', 0))
+                      for s, st in self.universe.stats.items()
+                      if hasattr(st, 'pct_change_24h')
+                      and abs(getattr(st, 'pct_change_24h', 0)) >= 1.5
+                      and getattr(st, 'vol_quote', 0) >= 1_000_000]
+        _all_movers.sort(key=lambda x: abs(x[1]), reverse=True)
+        _injected = 0
+        for sym, _ in _all_movers[:10]:
+            if sym not in self.universe.active:
+                self.universe.active.append(sym)
+                _injected += 1
+        if _injected:
+            self.logger.info(f"[INJECT] Added {_injected} movers to active set: "
+                f"{[(s, f'{p:.1f}%') for s,p in _all_movers[:_injected]]}")
         # Rotate universe (replace stale symbols with fresh candidates)
         # Check if rotation is needed (periodic check to avoid excessive rotation)
         from .config import ROTATION_CHECK_INTERVAL_SEC, MAX_ACTIVE_SYMBOLS
@@ -1043,6 +1058,30 @@ class ScalperBot:
         except Exception as e:
             self.logger.error(f"[EXIT_EXEC_ERROR] {symbol}: {type(e).__name__}: {e}")
 
+    async def _attach_protection(self, symbol: str, side: str, size: float,
+                                   sl_price: float, tp_price: float):
+        """Background task: place SL/TP after entry. Survives scan timeouts.
+        Updates self.positions[symbol] with real order IDs on success.
+        Monitor loop recovers PENDING if this task is interrupted."""
+        try:
+            sl_result = await self.order_manager.place_sl_order(symbol, side, size, sl_price)
+            tp_result = await self.order_manager.place_tp_order(symbol, side, size, tp_price)
+            if sl_result and tp_result:
+                if symbol in self.positions:
+                    self.positions[symbol]['sl_order_id'] = sl_result
+                    self.positions[symbol]['tp_order_id'] = tp_result
+                self.logger.info(f"[PROTECT] {symbol} SL={sl_result} TP={tp_result}")
+            elif symbol in self.positions:
+                # Partial — flag for monitor recovery
+                if sl_result:
+                    self.positions[symbol]['sl_order_id'] = sl_result
+                if tp_result:
+                    self.positions[symbol]['tp_order_id'] = tp_result
+                self.logger.warning(f"[PROTECT_PARTIAL] {symbol} SL={sl_result} TP={tp_result}")
+        except Exception as e:
+            self.logger.error(f"[PROTECT_FAIL] {symbol}: {type(e).__name__}: {e}")
+            # Position stays PENDING — monitor loop recovers
+
     async def _prefetch_news(self, ns, symbols: list):
         """Background task: fetch news sentiment for all tokens. Autonomous — no human review needed."""
         import time as _time
@@ -1156,10 +1195,10 @@ class ScalperBot:
             now = time.time()
             if now < self._circuit_paused_until:
                 return  # Still paused
-            # Start/reset pause
-            self._circuit_paused_until = now + 1800  # 30 min
-            self.logger.warning("[BREAKER] 3 consecutive losses — pausing 30 min")
-            return
+            # Pause expired — clear stale PnLs so bot can trade again
+            self._recent_exit_pnls.clear()
+            self._circuit_paused_until = 0
+            self.logger.warning("[BREAKER] 30-min loss pause expired — resuming trading")
 
         from .config import (
             MAX_LATENCY_MS, MIN_VOLUME_24H, MIN_SPREAD_BPS, DRY_RUN
@@ -1172,7 +1211,7 @@ class ScalperBot:
         scan_start_time = time.time()
         self.last_scan_start = scan_start_time
         self.is_scanning = True
-        
+
         # STARTUP DELAY: Informational only - never blocks entries
         # REPLAY MODE: Skip time-based warmup (entries allowed immediately)
         if self.replay_mode:
@@ -1931,12 +1970,15 @@ class ScalperBot:
                 if abs(self.btc_trend) < BTC_CHOP_THRESHOLD:
                     continue  # Silent — market has no direction for day trading either
 
-                # HARD PRICE FLOOR: Day trading needs real market structure. $2 minimum.
-                # Tokens below $2 are random walks — HTF trend doesn't apply.
+                # PRICE FLOOR: Tier A needs $1, Tier B allows micro-caps ($0.001).
+                # Checklist hygiene enforces per-tier floors — don't double-gate here.
                 _entry_price = getattr(stats, 'mark', 0.0) or getattr(stats, 'last', 0.0)
-                if _entry_price < 2.00:
+                _vol = getattr(stats, 'vol_quote', 0.0)
+                # Route: high-volume signals use structure Tier A (needs $1), rest use Tier B ($0.001)
+                _min_price = 1.00 if _vol >= 20_000_000 else 0.001
+                if _entry_price < _min_price:
                     self._log_signal_decision(symbol, signal, "rejected",
-                        f"RJ – price < \$2 (${_entry_price:.2f})")
+                        f"RJ – price < \${_min_price} (${_entry_price:.4f})")
                     loop_stats['rejected_by_filters'] += 1
                     continue
 
@@ -1956,7 +1998,7 @@ class ScalperBot:
                 _news_mod = 0
                 try:
                     from .news_sentiment import get_news_sentiment
-                    _ns = get_news_sentiment()
+                    _ns = get_news_sentiment(use_ollama=False)
                     _news_mod = await _ns.get_confluence_modifier(symbol, signal.side)
                 except Exception:
                     pass  # Never block entry
@@ -1971,9 +2013,10 @@ class ScalperBot:
                     advanced_features=_af,
                     current_price=_entry_price,
                     news_modifier=_news_mod,
+                    signal_type=signal.signal_type,
                 )
 
-                # Need 3/5 to pass
+                # Dual-tier checklist: Tier A (structure, 65pt) or Tier B (momentum, 45pt)
                 if not checklist.passed:
                     self._log_signal_decision(symbol, signal, "rejected",
                         checklist.reason)
@@ -2059,6 +2102,7 @@ class ScalperBot:
                 # This ensures Signal Health panel shows accurate pass rate (signals ready for entry)
                 passed_filters += 1  # Signal passed filter pipeline AND position manager check
                 entry_candidates += 1  # Track signals that passed position manager check
+                signals_pass_position_manager += 1  # Wire the dead counter
                 
                 # DEBUG: Log that we're about to attempt entry (demoted to DEBUG to reduce spam)
                 # Use dynamic cap for logging if equity available, else fallback to legacy
@@ -2431,10 +2475,24 @@ class ScalperBot:
                     if entry_symbol in self.funding_rates:
                         position_funding_rate = self.funding_rates[entry_symbol].get("rate", 0.0)
                     
-                    # Use signal's stop loss — now calculated from real ATR in signal generator
-                    initial_stop_price = signal.stop_loss
-                    
-                    # Use initial_stop_price for stop_loss (scalper uses tighter stops)
+                    # Use signal's stop loss — but recalculate from ACTUAL fill price.
+                    # Pre-trade estimate vs actual fill can differ enough to trigger -2021.
+                    _signal_stop_pct = abs(signal.stop_loss - signal.entry_price) / signal.entry_price
+                    if entry_side == "long":
+                        initial_stop_price = entry_price * (1 - _signal_stop_pct)
+                    else:
+                        initial_stop_price = entry_price * (1 + _signal_stop_pct)
+
+                    # Floor: enforce MIN_STOP_DISTANCE_PCT from actual fill
+                    from .config import MIN_STOP_DISTANCE_PCT
+                    _min_pct = MIN_STOP_DISTANCE_PCT / 100.0
+                    if entry_side == "long":
+                        _min_stop = entry_price * (1 - _min_pct)
+                        initial_stop_price = min(initial_stop_price, _min_stop)
+                    else:
+                        _min_stop = entry_price * (1 + _min_pct)
+                        initial_stop_price = max(initial_stop_price, _min_stop)
+
                     stop_loss_price = initial_stop_price
                     
                     # Calculate initial R (distance from entry to stop-loss)
@@ -2477,69 +2535,19 @@ class ScalperBot:
                         "peak_price": entry_price,
                         "trough_price": entry_price,
                     }
-                    # === SL/TP PLACEMENT — EXCHANGE-VERIFIED ===
-                    # Position MUST have both SL and TP confirmed on exchange before tracking.
-                    # Uses -4130 "order already exists" as verification: if we try to place
-                    # and get -4130, the order is definitely live. No trust, only proof.
-                    sl_ok = False
-                    tp_ok = False
-                    sl_id = None
-                    tp_id = None
-                    close_side = "sell" if entry_side == "long" else "buy"
-
-                    for attempt in range(3):  # 3 attempts over 1.5s — was 15 over 7.5s (excessive per research)
-                        await asyncio.sleep(0.5)
-                        # Try placing SL (or verify existing via -4130)
-                        if not sl_ok:
-                            try:
-                                result = await self.order_manager.place_sl_order(
-                                    entry_symbol, entry_side, filled_size, stop_loss_price)
-                                if result == "EXISTS":
-                                    sl_ok = True  # -4130: order definitely on exchange
-                                    sl_id = "EXISTS"
-                                elif result:
-                                    sl_ok = True  # Real order ID returned
-                                    sl_id = result
-                            except Exception:
-                                pass
-                        # Try placing TP (or verify existing via -4130)
-                        if not tp_ok:
-                            try:
-                                result = await self.order_manager.place_tp_order(
-                                    entry_symbol, entry_side, filled_size, signal.take_profit)
-                                if result == "EXISTS":
-                                    tp_ok = True
-                                    tp_id = "EXISTS"
-                                elif result:
-                                    tp_ok = True
-                                    tp_id = result
-                            except Exception:
-                                pass
-                        if sl_ok and tp_ok:
-                            self.logger.info(f"[VERIFIED] {entry_symbol} SL={'EXISTS' if sl_id=='EXISTS' else sl_id} TP={'EXISTS' if tp_id=='EXISTS' else tp_id}")
-                            break
-
-                    if not (sl_ok and tp_ok):
-                        # Failed to protect — close position. DO NOT TRACK (position never added).
-                        self.logger.critical(f"[UNPROTECTABLE] {entry_symbol} SL={sl_ok} TP={tp_ok} after 3 attempts — CLOSING")
-                        for close_i in range(5):
-                            try:
-                                await self.exchange_wrapper.exchange.create_order(
-                                    self.exchange_wrapper.denormalize_symbol(entry_symbol),
-                                    "market", close_side, filled_size, None,
-                                    {"reduceOnly": True})
-                                self.logger.info(f"[UNPROTECTABLE_CLOSED] {entry_symbol}")
-                                break
-                            except Exception as e:
-                                if close_i == 4:
-                                    self.logger.critical(f"[UNPROTECTABLE_FATAL] {entry_symbol} cannot close: {e}")
-                                await asyncio.sleep(1)
-                        continue  # DO NOT TRACK — position is closed, _new_position not added
-
-                    # ONLY track AFTER verified SL+TP on exchange
-                    _new_position["sl_order_id"] = sl_id
-                    _new_position["tp_order_id"] = tp_id
+                    # === SL/TP — BACKGROUND TASK ===
+                    # Track IMMEDIATELY with PENDING state so position is never invisible.
+                    # SL/TP placement runs as background task — survives scan timeouts.
+                    # Monitor loop recovers any PENDING SL/TP within 5s (line 2964).
+                    _new_position["sl_order_id"] = "PENDING"
+                    _new_position["tp_order_id"] = "PENDING"
                     self.positions[entry_symbol] = _new_position
+
+                    # Fire-and-forget: place SL+TP asynchronously
+                    asyncio.create_task(
+                        self._attach_protection(
+                            entry_symbol, entry_side, filled_size,
+                            stop_loss_price, signal.take_profit))
 
                     # LOGGING V2: Entry logging now handled by DecisionEvent (single concise line)
                     # Create canonical decision event for entry
@@ -2701,7 +2709,7 @@ class ScalperBot:
             if self._news_prefetch_counter % 60 == 0:  # ~10 min
                 try:
                     from .news_sentiment import get_news_sentiment
-                    _ns = get_news_sentiment()
+                    _ns = get_news_sentiment(use_ollama=False)
                     _to_scan = []
                     for _s, _st in self.universe.stats.items():
                         _px = getattr(_st, 'mark', 0) or getattr(_st, 'last', 0)
@@ -2791,11 +2799,186 @@ class ScalperBot:
             f"[DEBUG] entries_for_scan raw_signals={signals_found} filtered={passed_filters} "
             f"entry_candidates={entry_candidates} opened={entries_opened_this_scan}"
         )
-    
+
+    async def _naked_position_audit(self, monitor_now: float) -> None:
+        """
+        Cross-reference Binance positions against internal tracking.
+        Uses a separate rate-limit-disabled connection to avoid contention
+        with the main scan cycle's rate-limited exchange.
+        """
+        if not hasattr(self, '_last_naked_audit'):
+            self._last_naked_audit = 0
+        if not hasattr(self, '_naked_audit_failures'):
+            self._naked_audit_failures = 0
+        if monitor_now - self._last_naked_audit <= 120:
+            return  # Every 2 min — gives rate limit bucket time to refill
+        self._last_naked_audit = monitor_now
+        if not self.exchange_wrapper:
+            return
+        try:
+            # Separate exchange connection with rate limiting DISABLED.
+            # The main exchange's rate limiter blocks all calls during scan cycles.
+            # This dedicated connection has its own bucket — audit NEVER blocks.
+            if not hasattr(self, '_audit_ex') or self._audit_ex is None:
+                import ccxt.async_support as _ccxt
+                self._audit_ex = _ccxt.binanceusdm({
+                    'apiKey': self.exchange_wrapper.api_key,
+                    'secret': self.exchange_wrapper.api_secret,
+                    'enableRateLimit': False,
+                    'timeout': 10000,
+                    'options': {'defaultType': 'future', 'test': False},
+                })
+            raw_audit = await asyncio.wait_for(
+                self._audit_ex.fetchPositionsRisk(), timeout=8.0)
+
+            exchange_open = {}
+            for p in (raw_audit or []):
+                amt = float(p.get('positionAmt', 0))
+                if amt == 0:
+                    continue
+                raw_sym = p.get('symbol', '')
+                sym = self.exchange_wrapper.normalize_symbol(raw_sym)
+                exchange_open[sym] = {
+                    'symbol': sym,
+                    'contracts': abs(amt),
+                    'side': 'long' if amt > 0 else 'short',
+                    'entryPrice': float(p.get('entryPrice', 0)),
+                }
+            # Reset failure counter on success
+            self._naked_audit_failures = 0
+            tracked_symbols = set(self.positions.keys())
+
+            # STEP 1: Remove ghosts — tracked but NOT on exchange
+            ghosts_found = []
+            for tsym in list(tracked_symbols):
+                if tsym not in exchange_open:
+                    ghosts_found.append(tsym)
+            for gsym in ghosts_found:
+                self.logger.warning(f"[RECONCILE] {gsym} in tracking but NOT on Binance — removing ghost")
+                if gsym in self.positions:
+                    del self.positions[gsym]
+            if ghosts_found:
+                self._last_exchange_pos_count = len(exchange_open)
+                self._last_exchange_count_ts = time.time()
+                tracked_symbols = set(self.positions.keys())
+
+            _SUSPECT_ORDER_IDS = frozenset({"RECONCILED", "PENDING", None, ""})
+            _DRY_PREFIX = "DRY_"
+
+            for normalized, pos in exchange_open.items():
+                side = pos.get('side', 'long')
+                qty = float(pos.get('contracts', 0))
+                entry = float(pos.get('entryPrice', 0))
+                close_side = 'sell' if side == 'long' else 'buy'
+                from .config import MIN_STOP_DISTANCE_PCT; _d = MIN_STOP_DISTANCE_PCT / 100.0
+                real_sl = round(entry * ((1 - _d) if side == 'long' else (1 + _d)), 4)
+                real_tp = round(entry * ((1 + _d) if side == 'long' else (1 - _d)), 4)
+
+                if normalized in tracked_symbols:
+                    tracked = self.positions.get(normalized, {})
+                    sl_id = str(tracked.get('sl_order_id', ''))
+                    tp_id = str(tracked.get('tp_order_id', ''))
+                    needs_verify = (
+                        sl_id in _SUSPECT_ORDER_IDS or sl_id.startswith(_DRY_PREFIX) or
+                        tp_id in _SUSPECT_ORDER_IDS or tp_id.startswith(_DRY_PREFIX)
+                    )
+                    if not needs_verify:
+                        continue
+
+                    # Verify with -4130 test
+                    has_sl = has_tp = False
+                    try:
+                        await self.exchange_wrapper.create_order(normalized, 'STOP_MARKET',
+                            close_side, qty, None, {'stopPrice': real_sl, 'closePosition': 'true'})
+                    except Exception as e:
+                        if '4130' in str(e):
+                            has_sl = True
+                    try:
+                        await self.exchange_wrapper.create_order(normalized, 'TAKE_PROFIT_MARKET',
+                            close_side, qty, None, {'stopPrice': real_tp, 'closePosition': 'true'})
+                    except Exception as e:
+                        if '4130' in str(e):
+                            has_tp = True
+
+                    if has_sl and has_tp:
+                        tracked['sl_order_id'] = 'EXISTS'
+                        tracked['tp_order_id'] = 'EXISTS'
+                        self.logger.info(f"[NAKED_AUDIT] {normalized} tracked + verified protected via -4130")
+                    else:
+                        self.logger.error(f"[NAKED_AUDIT] {normalized} TRACKED BUT NAKED! Placing SL/TP.")
+                        try:
+                            new_sl = await self.order_manager.place_sl_order(normalized, side, qty, real_sl)
+                            new_tp = await self.order_manager.place_tp_order(normalized, side, qty, real_tp)
+                            tracked['sl_order_id'] = new_sl or 'RECONCILED'
+                            tracked['tp_order_id'] = new_tp or 'RECONCILED'
+                            self.logger.info(f"[NAKED_AUDIT] {normalized} PROTECTED: SL={new_sl} TP={new_tp}")
+                        except Exception as e:
+                            self.logger.critical(f"[NAKED_AUDIT] {normalized} PROTECTION FAILED: {e}")
+                    continue
+
+                # UNTRACKED POSITION — check if protected, then reconcile or protect
+                has_sl = False
+                has_tp = False
+                try:
+                    await self.exchange_wrapper.create_order(normalized, 'STOP_MARKET', close_side, qty, None,
+                        {'stopPrice': real_sl, 'closePosition': 'true'})
+                except Exception as e:
+                    if '4130' in str(e):
+                        has_sl = True
+                try:
+                    await self.exchange_wrapper.create_order(normalized, 'TAKE_PROFIT_MARKET', close_side, qty, None,
+                        {'stopPrice': real_tp, 'closePosition': 'true'})
+                except Exception as e:
+                    if '4130' in str(e):
+                        has_tp = True
+
+                if has_sl and has_tp:
+                    self.logger.warning(f"[NAKED_AUDIT] {normalized} exists on exchange with SL+TP but not tracked. Reconciling.")
+                    est_sl2 = round(entry * (0.982 if side == 'long' else 1.018), 4)
+                    self.positions[normalized] = {
+                        'symbol': normalized, 'side': side, 'size': qty,
+                        'entry_price': entry, 'entry_time': time.time(),
+                        'sl_order_id': 'RECONCILED', 'tp_order_id': 'RECONCILED',
+                        'initial_stop_price': est_sl2, 'stop_loss': est_sl2,
+                        'take_profit': round(entry * (1.018 if side == 'long' else 0.982), 4),
+                        'signal_score': 50, 'leverage': LEVERAGE_BASE
+                    }
+                else:
+                    self.logger.error(f"[NAKED_AUDIT] {normalized} NAKED on exchange! Placing SL/TP NOW.")
+                    real_sl2 = round(entry * (1 - 0.018) if side == 'long' else entry * (1 + 0.018), 4)
+                    real_tp2 = round(entry * (1 + 0.018) if side == 'long' else entry * (1 - 0.018), 4)
+                    try:
+                        sl_result = await self.order_manager.place_sl_order(normalized, side, qty, real_sl2)
+                        tp_result = await self.order_manager.place_tp_order(normalized, side, qty, real_tp2)
+                        self.logger.info(f"[NAKED_AUDIT] {normalized} PROTECTED: SL={sl_result} TP={tp_result}")
+                        self.positions[normalized] = {
+                            'symbol': normalized, 'side': side, 'size': qty,
+                            'entry_price': entry, 'entry_time': time.time(),
+                            'sl_order_id': sl_result, 'tp_order_id': tp_result,
+                            'initial_stop_price': real_sl2, 'stop_loss': real_sl2,
+                            'leverage': LEVERAGE_BASE
+                        }
+                    except Exception as e:
+                        self.logger.error(f"[NAKED_AUDIT] FAILED to protect {normalized}: {e}")
+        except Exception as e:
+            self._naked_audit_failures += 1
+            if self._naked_audit_failures <= 3:
+                self.logger.error(f"[NAKED_AUDIT] Audit failed: {type(e).__name__}: {e}")
+            elif self._naked_audit_failures == 4:
+                self.logger.warning("[NAKED_AUDIT] Audit failing repeatedly — suppressing logs until recovery")
+
     async def monitor_and_exit_positions(self) -> None:
         """Monitor open positions and exit when stop-loss or take-profit is hit."""
         if not self.exit_manager:
             return
+
+        # OPTIMIZATION: Cache time once for all position checks
+        monitor_now = time.time()
+
+        # NAKED AUDIT: DISABLED — separate exchange connection can't reliably
+        # fetch positions and wrongly ghosts valid tracked positions.
+        # Startup reconciliation handles external/manual positions at boot.
+        # await self._naked_position_audit(monitor_now)
 
         if not self.positions:
             return
@@ -2803,9 +2986,6 @@ class ScalperBot:
         # OPTIMIZATION: Cache equity calculation (used in exit logic)
         equity = self.equity_now()
         positions_to_exit = []
-        
-        # OPTIMIZATION: Cache time once for all position checks
-        monitor_now = time.time()
 
         # PRIORITY 0: Place SL/TP for any PENDING entries IMMEDIATELY.
         # These positions were entered without atomic SL/TP (-2021 retry) and are naked.
@@ -3729,158 +3909,6 @@ class ScalperBot:
             # Non-critical, don't break execution
             self.logger.debug(f"[SELF-CHECK] Failed to verify exit events: {e}")
 
-        # ======== NAKED POSITION AUDIT ========
-        # Every 60s, cross-reference Binance positions against internal tracking.
-        # Binance is the ONLY source of truth — if a position exists on exchange
-        # but not in self.positions, it's either an orphan from a crashed session
-        # or a reconciliation failure. Either way: verify protection or add it.
-        if not hasattr(self, '_last_naked_audit'):
-            self._last_naked_audit = 0
-        if monitor_now - self._last_naked_audit > 10:  # Every 10s (was 30s) — minimize naked windows
-            self._last_naked_audit = monitor_now
-            try:
-                raw_audit = await asyncio.wait_for(
-                    self._fetch_positions_lightweight(), timeout=6.0)
-                # Convert lightweight format to match expected dict keys
-                exchange_open = {}
-                for sym, info in raw_audit.items():
-                    exchange_open[sym] = {
-                        'symbol': sym,
-                        'contracts': info['contracts'],
-                        'side': info['side'],
-                        'entryPrice': info['entryPrice'],
-                    }
-                tracked_symbols = set(self.positions.keys())
-
-                # STEP 1: Remove ghosts — positions in tracking but NOT on exchange
-                ghosts_found = []
-                for tsym in list(tracked_symbols):
-                    if tsym not in exchange_open:
-                        ghosts_found.append(tsym)
-                for gsym in ghosts_found:
-                    self.logger.warning(f"[RECONCILE] {gsym} in tracking but NOT on Binance — removing ghost")
-                    # positions dict already handles removal
-                    if gsym in self.positions:
-                        del self.positions[gsym]
-                if ghosts_found:
-                    self._last_exchange_pos_count = len(exchange_open)
-                    self._last_exchange_count_ts = time.time()
-                    tracked_symbols = set(self.positions.keys())
-                # Tracked positions with suspect SL/TP state — verify with -4130 test
-                _SUSPECT_ORDER_IDS = frozenset({"RECONCILED", "PENDING", None, ""})
-                _DRY_PREFIX = "DRY_"
-
-                for normalized, pos in exchange_open.items():
-                    side = pos.get('side', 'long')
-                    qty = float(pos.get('contracts', 0))
-                    entry = float(pos.get('entryPrice', 0))
-                    close_side = 'sell' if side == 'long' else 'buy'
-                    from .config import MIN_STOP_DISTANCE_PCT; _d = MIN_STOP_DISTANCE_PCT / 100.0; real_sl = round(entry * ((1 - _d) if side == 'long' else (1 + _d)), 4)
-                    real_tp = round(entry * ((1 + _d) if side == 'long' else (1 - _d)), 4)
-
-                    if normalized in tracked_symbols:
-                        # Bot tracks this position — verify its protection is real, not just a sentinel
-                        tracked = self.positions.get(normalized, {})
-                        sl_id = str(tracked.get('sl_order_id', ''))
-                        tp_id = str(tracked.get('tp_order_id', ''))
-                        needs_verify = (
-                            sl_id in _SUSPECT_ORDER_IDS or sl_id.startswith(_DRY_PREFIX) or
-                            tp_id in _SUSPECT_ORDER_IDS or tp_id.startswith(_DRY_PREFIX)
-                        )
-                        if not needs_verify:
-                            continue  # Has real order IDs — trust them
-
-                        # Verify with -4130 test
-                        has_sl = has_tp = False
-                        try:
-                            await self.exchange_wrapper.create_order(normalized, 'STOP_MARKET',
-                                close_side, qty, None, {'stopPrice': real_sl, 'closePosition': 'true'})
-                        except Exception as e:
-                            if '4130' in str(e):
-                                has_sl = True
-                        try:
-                            await self.exchange_wrapper.create_order(normalized, 'TAKE_PROFIT_MARKET',
-                                close_side, qty, None, {'stopPrice': real_tp, 'closePosition': 'true'})
-                        except Exception as e:
-                            if '4130' in str(e):
-                                has_tp = True
-
-                        if has_sl and has_tp:
-                            # Protection confirmed — update tracking with verified sentinel
-                            tracked['sl_order_id'] = 'EXISTS'
-                            tracked['tp_order_id'] = 'EXISTS'
-                            self.logger.info(
-                                f"[NAKED_AUDIT] {normalized} tracked + verified protected via -4130")
-                        else:
-                            # Tracked but naked — place real protection
-                            self.logger.error(
-                                f"[NAKED_AUDIT] {normalized} TRACKED BUT NAKED! Placing SL/TP.")
-                            try:
-                                new_sl = await self.order_manager.place_sl_order(
-                                    normalized, side, qty, real_sl)
-                                new_tp = await self.order_manager.place_tp_order(
-                                    normalized, side, qty, real_tp)
-                                tracked['sl_order_id'] = new_sl or 'RECONCILED'
-                                tracked['tp_order_id'] = new_tp or 'RECONCILED'
-                                self.logger.info(
-                                    f"[NAKED_AUDIT] {normalized} PROTECTED: SL={new_sl} TP={new_tp}")
-                            except Exception as e:
-                                self.logger.critical(
-                                    f"[NAKED_AUDIT] {normalized} PROTECTION FAILED: {e}")
-                        continue
-
-                    has_sl = False
-                    has_tp = False
-                    try:
-                        await self.exchange_wrapper.create_order(normalized, 'STOP_MARKET', close_side, qty, None,
-                            {'stopPrice': real_sl, 'closePosition': 'true'})
-                    except Exception as e:
-                        if '4130' in str(e):
-                            has_sl = True
-
-                    try:
-                        await self.exchange_wrapper.create_order(normalized, 'TAKE_PROFIT_MARKET', close_side, qty, None,
-                            {'stopPrice': real_tp, 'closePosition': 'true'})
-                    except Exception as e:
-                        if '4130' in str(e):
-                            has_tp = True
-
-                    if has_sl and has_tp:
-                        # Protected but untracked — reconcile
-                        self.logger.warning(f"[NAKED_AUDIT] {normalized} exists on exchange with SL+TP but not tracked. Reconciling.")
-                        est_sl2 = round(entry * (0.982 if side == 'long' else 1.018), 4)
-                        self.positions[normalized] = {
-                            'symbol': normalized, 'side': side, 'size': qty,
-                            'entry_price': entry, 'entry_time': time.time(),
-                            'sl_order_id': 'RECONCILED', 'tp_order_id': 'RECONCILED',
-                            'initial_stop_price': est_sl2, 'stop_loss': est_sl2,
-                            'take_profit': round(entry * (1.018 if side == 'long' else 0.982), 4),
-                            'signal_score': 50,  # Default — prevents instant replacement
-                            'leverage': LEVERAGE_BASE
-                        }
-                        # already tracked in self.positions
-                    else:
-                        # NAKED! Place protection immediately
-                        self.logger.error(f"[NAKED_AUDIT] {normalized} NAKED on exchange! Placing SL/TP NOW.")
-                        real_sl = round(entry * (1 - 0.018) if side == 'long' else entry * (1 + 0.018), 4)
-                        real_tp = round(entry * (1 + 0.018) if side == 'long' else entry * (1 - 0.018), 4)
-                        try:
-                            sl_result = await self.order_manager.place_sl_order(normalized, side, qty, real_sl)
-                            tp_result = await self.order_manager.place_tp_order(normalized, side, qty, real_tp)
-                            self.logger.info(f"[NAKED_AUDIT] {normalized} PROTECTED: SL={sl_result} TP={tp_result}")
-                            self.positions[normalized] = {
-                                'symbol': normalized, 'side': side, 'size': qty,
-                                'entry_price': entry, 'entry_time': time.time(),
-                                'sl_order_id': sl_result, 'tp_order_id': tp_result,
-                                'initial_stop_price': real_sl, 'stop_loss': real_sl,
-                                'leverage': LEVERAGE_BASE
-                            }
-                            # already tracked in self.positions
-                        except Exception as e:
-                            self.logger.error(f"[NAKED_AUDIT] FAILED to protect {normalized}: {e}")
-            except Exception as e:
-                self.logger.error(f"[NAKED_AUDIT] Audit failed: {type(e).__name__}: {e}")
-
     def _log_signal_decision(self, symbol: str, signal, action: str, reason: Optional[str] = None):
         """
         Log signal decision with full score breakdown to decisions.jsonl.
@@ -4025,8 +4053,7 @@ class ScalperBot:
                                 self.logger.error(f"[STARTUP] TP placement failed for {sym}: {e}")
 
                         # If protection failed, close the position — can't trade naked
-                        # Sub-dollar tokens: skip SL/TP, force-close immediately
-                        if not (has_sl and has_tp) or entry < 0.50:
+                        if not (has_sl and has_tp):
                             self.logger.critical(
                                 f"[STARTUP] {sym} UNPROTECTABLE (entry=\${entry:.4f}) — closing position")
                             # Try up to 3 times with increasing aggression
@@ -4226,8 +4253,10 @@ class ScalperBot:
                 try:
                     await asyncio.wait_for(self.scan_and_enter_signals(), timeout=30.0)
                 except asyncio.TimeoutError:
+                    self.is_scanning = False
                     self.logger.error("[TIMEOUT] scan_and_enter_signals() hung — skipping this cycle")
                 except Exception as e:
+                    self.is_scanning = False
                     self.logger.error(f"[SCAN_ERROR] {type(e).__name__}: {e}")
 
                 # Signal confirmation cleanup (every 5 minutes)

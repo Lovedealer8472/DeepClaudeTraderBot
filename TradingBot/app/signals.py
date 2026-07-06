@@ -288,9 +288,11 @@ class SignalGenerator:
         spread_bps = symbol_stats.get('spread_bps', 9999)
         volume_24h = symbol_stats.get('vol_quote', 0)
         
-        if not (bid > 0 and ask > 0 and last > 0):
+        if not (bid > 0 and ask > 0):
             return None
-        
+        if last <= 0:
+            last = (bid + ask) / 2  # Fallback for thin tokens
+
         entry_price = (bid + ask) / 2  # Use mid price
         
         # Try multiple signal types
@@ -356,9 +358,21 @@ class SignalGenerator:
         # Store old score in signal (for backward compatibility)
         best_signal.signal_score = signal_score
         base_final_score = signal_score.final_score
+        # Floor: any signal on a significant 24h move gets minimum score
+        # Signal scorer returns 0 for thin tokens without orderbook data.
+        # Without this floor, HARD_MIN_SCORE kills all momentum/reversal on movers.
+        _abs_pct = abs(symbol_stats.get('pct_change_24h', 0))
+        if _abs_pct >= 3.0:
+            floor = 50.0 if _abs_pct >= 10 else 40.0
+            if best_signal.signal_type == 'mean_reversion':
+                floor = max(floor, 45.0 if _abs_pct < 15 else 50.0)
+            base_final_score = max(base_final_score, floor)
+            best_signal.final_score = base_final_score
+            best_signal.strength = max(best_signal.strength, base_final_score / 100.0)
         
         # SCORING V2: Only run if SignalScorer didn't already do it (avoid double compute)
         from .config import USE_NEW_SCORING_SYSTEM as _USE_NEW_SCORING
+        recent_trades_list = recent_trades if recent_trades else []
         if not _USE_NEW_SCORING:
             try:
                 # Get advanced_features if available (needed for Scoring v2)
@@ -388,8 +402,8 @@ class SignalGenerator:
                 best_signal.score_v2 = final_score_v2
                 best_signal.score_components_raw = raw_components.to_dict()
                 best_signal.score_components_capped = capped_components.to_dict()
-            
-        except Exception as e:
+
+            except Exception as e:
                 # Fallback to old score if Scoring v2 fails
                 import logging
                 logger = logging.getLogger("SignalGenerator")
@@ -397,10 +411,9 @@ class SignalGenerator:
                 best_signal.final_score = base_final_score
                 best_signal.strength = base_final_score / 100.0
                 best_signal.score_v2 = None
-            best_signal.score_components_raw = None
-            best_signal.score_components_capped = None
-                        # Calculate dynamic thresholds (always called, but only used if DYNAMIC_THRESHOLDS_ENABLED is True)
-            recent_trades_list = recent_trades if recent_trades else []
+                best_signal.score_components_raw = None
+                best_signal.score_components_capped = None
+        # Calculate dynamic thresholds (always called, but only used if DYNAMIC_THRESHOLDS_ENABLED is True)
         btc_trend_value = btc_trend if btc_trend is not None else 0.0
         dynamic_score, dynamic_strength, dynamic_percentile = self._calculate_dynamic_thresholds(
             recent_trades_list, volatility_regime, btc_trend_value
@@ -429,7 +442,6 @@ class SignalGenerator:
             }
         
         # HARD MINIMUM SCORE THRESHOLD: Reject immediately if below HARD_MIN_SCORE
-        # Use Scoring v2 final_score (or base if v2 failed)
         score_to_check = best_signal.final_score
         if score_to_check < HARD_MIN_SCORE:
             # Track rejected signal in history for percentile calculation
@@ -695,25 +707,29 @@ class SignalGenerator:
         pct_change = symbol_stats.get('pct_change_24h', 0)
         volume_24h = symbol_stats.get('vol_quote', 0)
 
-        # Need significant move for reversal signal
-        if abs(pct_change) < 3.0:
+        # Parabolic cap: don't fade +25%+ or -25%+ moves — too dangerous
+        if abs(pct_change) > 25:
             return None
 
-        # Volume check: need at least $5M 24h volume
-        if volume_24h < 5_000_000:
+        # Need moderate move for reversal signal
+        if abs(pct_change) < 1.5:
+            return None
+
+        # Volume check: need at least $1M 24h volume (was $5M — blocked all movers)
+        if volume_24h < 1_000_000:
             return None
 
         # Overbought → short (up too much, due for pullback)
-        if pct_change > 3.0:
+        if pct_change > 1.5:
             side = "short"
-            # Strength: linear 3%→10%, capped at 0.75
-            strength = min((pct_change - 3.0) / 7.0, 0.75)
+            # Strength: linear 1.5%→10%, capped at 0.90 (beats momentum at 0.88)
+            strength = min((pct_change - 1.5) / 8.5, 0.90)
             # Wider stops for reversal (counter-trend trades need room)
             stop_loss_pct = 0.025  # 2.5% stop
             take_profit_pct = 0.030  # 3.0% target (tight — quick pullback)
             reason = f"Overbought reversal ({pct_change:.1f}% up in 24h)"
         # Oversold → long (down too much, due for bounce)
-        elif pct_change < -3.0:
+        elif pct_change < -2.0:
             side = "long"
             strength = min(abs(pct_change + 5.0) / 10.0, 0.75)
             stop_loss_pct = 0.025  # 2.5% stop
